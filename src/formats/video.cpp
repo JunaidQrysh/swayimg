@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
-// Video as storyboard image format.
+// Video format: single frame preview, playback via external player.
 // Copyright (C) 2026 Artem Senichev <artemsen@gmail.com>
 
 #include "../imageformat.hpp"
-#include "../resources.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -42,46 +41,22 @@ public:
             return nullptr;
         }
 
-        // storyboard grid
-        const size_t grid_cols = columns;
-        const size_t grid_rows = rows;
-
-        // tile size derived from video aspect ratio
+        // single frame (at 1/3 of duration) as a placeholder, the video
+        // itself is played by an external player
         const double aspect = decoder.aspect();
-        const size_t tile_width = size;
-        const size_t tile_height = std::clamp(
-            static_cast<size_t>(static_cast<double>(tile_width) / aspect),
-            static_cast<size_t>(1), tile_width * 2);
+        const size_t sz =
+            std::min(std::max(decoder.width(), decoder.height()), size);
+        size_t width = aspect >= 1.0 ? sz : static_cast<size_t>(sz * aspect);
+        size_t height = aspect >= 1.0 ? static_cast<size_t>(sz / aspect) : sz;
+        width = std::max(width, static_cast<size_t>(1));
+        height = std::max(height, static_cast<size_t>(1));
 
-        // allocate storyboard canvas
         ImagePtr image = std::make_shared<Image>();
         image->frames.resize(1);
-        Pixmap& canvas = image->frames[0].pm;
-        canvas.create(Pixmap::ARGB,
-                      grid_cols * tile_width + (grid_cols - 1) * padding,
-                      grid_rows * tile_height + (grid_rows - 1) * padding);
-        canvas.fill({ 0, 0, canvas.width(), canvas.height() },
-                    { argb_t::max, argb_t::min, argb_t::min, argb_t::min });
-
-        // grab frames evenly spaced over the video duration
-        int64_t total = decoder.duration();
-        total -= total / 5;
-        const size_t count = grid_cols * grid_rows;
-        for (size_t i = 0; i < count; ++i) {
-            const int64_t target = total * static_cast<int64_t>(i * 2 + 1) /
-                static_cast<int64_t>(count * 2);
-
-            Pixmap tile;
-            tile.create(Pixmap::ARGB, tile_width, tile_height);
-            if (decoder.grab_frame(target, tile)) {
-                const size_t col = i % grid_cols;
-                const size_t row = i / grid_cols;
-                const Point pos {
-                    .x = static_cast<ssize_t>(col * (tile_width + padding)),
-                    .y = static_cast<ssize_t>(row * (tile_height + padding)),
-                };
-                canvas.copy(tile, pos);
-            }
+        Pixmap& pm = image->frames[0].pm;
+        pm.create(Pixmap::ARGB, width, height);
+        if (!decoder.grab_frame(decoder.duration() / 3, pm)) {
+            return nullptr;
         }
 
         image->format = std::format("Video ({}) {} {}x{}", decoder.codec_name(),
@@ -116,24 +91,13 @@ public:
             return {};
         }
 
-        Pixmap thumb = make_thumb(pm, sz, fill);
-
-        if (thumb && label.a) {
-            constexpr ssize_t margin = 5;
-            thumb.mask(Resource::video, { .x = margin, .y = margin }, label);
-        }
-
-        return thumb;
+        return make_thumb(pm, sz, fill);
     }
 
     void set_config(Config& params) override
     {
         ImageFormat::set_config(params);
         params.get("size", size, 10, 10000);
-        params.get("columns", columns, 1, 100);
-        params.get("rows", rows, 1, 100);
-        params.get("padding", padding, 0, 1000);
-        params.get("label", label);
     }
 
 private:
@@ -160,12 +124,7 @@ private:
     }
 
 private:
-    size_t size = 300;  ///< Size (width) of a single tile (frame)
-    size_t columns = 3; ///< Number of columns in storyboard
-    size_t rows = 3;    ///< Number of rows in storyboard
-    size_t padding = 5; ///< Gap between tiles in pixels
-    argb_t label = { 0xa0, argb_t::max, argb_t::max,
-                     argb_t::max }; ///< Label color
+    size_t size = 1920; ///< Max size of the frame shown in viewer
 
 private:
     /** Memory buffer reader. */
@@ -335,6 +294,10 @@ private:
                 return false;
             }
             dec->thread_count = 0;
+            // decode keyframes only: seeking always lands on a keyframe, so
+            // there is no need to decode intermediate frames up to the exact
+            // timestamp, which is very slow for high resolution videos
+            dec->skip_frame = AVDISCARD_NONKEY;
             if (avcodec_open2(dec, codec, nullptr) < 0) {
                 return false;
             }
@@ -424,7 +387,7 @@ private:
         [[nodiscard]] const std::string& codec_name() const { return cname; }
 
         /**
-         * Grab frame.
+         * Grab frame (the nearest keyframe before the specified time).
          * @param time stream time base units
          * @param pm target pixmap
          * @return true if frame grabbed
@@ -462,14 +425,8 @@ private:
                         break;
                     }
 
-                    int64_t pts = frame->best_effort_timestamp;
-                    if (pts == AV_NOPTS_VALUE) {
-                        pts = frame->pts;
-                    }
-                    if (pts == AV_NOPTS_VALUE || pts >= time) {
-                        found = true;
-                        break;
-                    }
+                    found = true;
+                    break;
                 }
             }
             av_packet_free(&pkt);

@@ -14,11 +14,11 @@ bool ImageEntry::is_special(const std::string& path)
         path.starts_with(ImageEntry::SRC_EXEC);
 }
 
-void Image::draw(const size_t frame, Pixmap& target, const double scale,
+void Image::draw(const size_t frame, Canvas& target, const double scale,
                  const ssize_t x, const ssize_t y)
 {
     assert(frame < frames.size());
-    Render::self().draw(target, frames[frame].pm, { .x = x, .y = y }, scale);
+    target.draw(frames[frame].pm, { .x = x, .y = y }, scale);
 }
 
 void Image::flip_vertical()

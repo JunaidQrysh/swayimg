@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: MIT
+// GPU canvas: draws using OpenGL ES 3.0.
+
+#pragma once
+
+#include "canvas.hpp"
+
+#include <GLES3/gl3.h>
+
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
+class GlCanvas : public Canvas {
+public:
+    GlCanvas() = default;
+    ~GlCanvas() override;
+
+    GlCanvas(const GlCanvas&) = delete;
+    GlCanvas& operator=(const GlCanvas&) = delete;
+
+    /**
+     * Initialize GL resources, GL context must be current.
+     * @return false on error
+     */
+    bool initialize();
+
+    /**
+     * Begin frame.
+     * @param size framebuffer size in pixels
+     */
+    void begin(const Size& size);
+
+    /**
+     * Finish frame (free unused resources).
+     */
+    void end();
+
+    /**
+     * Compile shaders in advance by drawing offscreen (call between frames).
+     */
+    void warmup();
+
+    [[nodiscard]] Size size() const override { return fb_size; }
+
+    void fill(const Rectangle& rect, const argb_t& color) override;
+    void fill_blend(const Rectangle& rect, const argb_t& color) override;
+    void fill_inverse(const Rectangle& preserve, const argb_t& color) override;
+    void grid(const Rectangle& rect, const size_t cell, const argb_t& clr0,
+              const argb_t& clr1) override;
+    void rectangle(const Rectangle& rect, const argb_t& color,
+                   const size_t thickness) override;
+    void mask(const Pixmap& mask, const Point& pos,
+              const argb_t& color) override;
+    void blend(const Pixmap& src, const Point& pos) override;
+    using Canvas::draw;
+    void draw(const Pixmap& src, const Point& pos, const double scale,
+              const Rectangle& clip, const double opacity) override;
+    void background(const Background mode, const Rectangle& preserve) override;
+    void dim_outside(const Point& center, const size_t radius,
+                     const double factor) override;
+    void raster(const std::function<void(Pixmap&)>& fn) override;
+    bool draw_texture(const TextureRenderer& fn, const Size& src_size,
+                      const double render_scale, const Point& pos,
+                      const double scale, const Rectangle& clip) override;
+    void begin_layer() override;
+    void end_layer(const double opacity) override;
+
+private:
+    /** Texture tile (large images are split to multiple textures). */
+    struct Tile {
+        GLuint id;      ///< GL texture
+        Rectangle area; ///< Area of the source pixmap
+    };
+
+    /** Cached texture created from pixmap. */
+    struct Texture {
+        std::vector<Tile> tiles; ///< Texture tiles
+        size_t bytes = 0;        ///< Size in GPU memory
+        uint64_t last_use = 0;   ///< Number of the frame where used last time
+        bool mipmap = false;     ///< Mipmaps generated
+    };
+
+    /** Shader program with uniform locations. */
+    struct Program {
+        GLuint id = 0;
+        GLint viewport = -1;
+        GLint color = -1;
+        GLint color2 = -1;
+        GLint param = -1;
+        GLint param2 = -1;
+    };
+
+    /** Offscreen render target. */
+    struct Target {
+        GLuint fbo = 0;
+        GLuint tex = 0;
+        Size size;
+    };
+
+    /** Blending modes. */
+    enum class Blend : uint8_t {
+        None,     ///< Replace pixels
+        Straight, ///< Source with straight alpha
+        Premult,  ///< Source with premultiplied alpha
+        Multiply, ///< Multiply destination color by source color
+    };
+
+    /** Quad vertex: position and texture coordinates. */
+    struct UvRect {
+        float u0, v0, u1, v1;
+    };
+
+    static GLuint compile(const char* fragment);
+    static Program make_program(const char* fragment);
+
+    const Texture& get_texture(const Pixmap& pm, const bool mipmap);
+    static void free_texture(Texture& tex);
+
+    void set_blend(const Blend mode);
+    void use(const Program& prog, const Size& viewport);
+    void quad(const float x, const float y, const float w, const float h,
+              const UvRect& uv = { 0.0f, 0.0f, 1.0f, 1.0f });
+    void solid(const Rectangle& rect, const argb_t& color, const Blend mode);
+
+    void bind_target(const Target* target);
+    void bind_output(); ///< Bind current output: layer or window
+    void reset_state(); ///< Restore GL state after external renderer
+    static bool resize_target(Target& target, const Size& size);
+    static void free_target(Target& target);
+
+    Size fb_size;            ///< Current framebuffer size
+    uint64_t frame = 0;      ///< Frame counter
+    GLint max_tex_size = 0;  ///< Max texture size supported by GPU
+    GLuint vao = 0;          ///< Vertex array
+    GLuint vbo = 0;          ///< Vertex buffer
+    Blend blend_mode = Blend::None;
+
+    Program prog_solid;  ///< Solid color
+    Program prog_tex;    ///< Textured quad
+    Program prog_mask;   ///< Grayscale mask with color
+    Program prog_grid;   ///< Chessboard
+    Program prog_dim;    ///< Dim outside circle
+    Program prog_blur;   ///< Separable gaussian blur
+
+    std::unordered_map<uint64_t, Texture> textures; ///< Texture cache
+    size_t textures_bytes = 0;                      ///< Total size of cache
+
+    GLuint capture_tex = 0; ///< Captured framebuffer area (backgrounds)
+    Target blur[2];         ///< Blur render targets
+    Target layer;              ///< Offscreen layer
+    bool layer_active = false; ///< Drawing to the layer
+    const Target* output = nullptr; ///< Offscreen output (nullptr = window)
+    GLuint raster_tex = 0;  ///< Software rasterized layer
+    Pixmap raster_pm;       ///< Software rasterized layer pixmap
+};

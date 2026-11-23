@@ -148,6 +148,13 @@ public:
         if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
             ui->mouse_buttons &= ~btn;
             ui->set_cursor(Ui::CursorShape::Default);
+            Application::self().add_event(AppEvent::MouseClick {
+                .mouse = { .buttons = ui->mouse_buttons,
+                          .mods = ui->xkb.get_modifiers() },
+                .pointer = ui->mouse_pos,
+                .button = btn,
+                .pressed = false,
+            });
         } else {
             ui->mouse_buttons |= btn;
             const InputMouse input {
@@ -158,6 +165,8 @@ public:
                 Application::self().add_event(AppEvent::MouseClick {
                     .mouse = input,
                     .pointer = ui->mouse_pos,
+                    .button = btn,
+                    .pressed = true,
                 });
             } else {
                 // start drag-and-drop
@@ -186,10 +195,11 @@ public:
         }
     }
 
-    static void on_pointer_axis(void* data, struct wl_pointer*, uint32_t,
+    static void on_pointer_axis(void* data, struct wl_pointer*, uint32_t time,
                                 uint32_t axis, wl_fixed_t value)
     {
         UiWayland* ui = reinterpret_cast<UiWayland*>(data);
+        ui->scroll_time = time;
 
         if (!ui->scroll_hires) {
             // approximately correspond to the value120
@@ -205,11 +215,22 @@ public:
         }
     }
 
-    static void on_pointer_axis_source(void*, struct wl_pointer*, uint32_t) {}
-
-    static void on_pointer_axis_stop(void*, struct wl_pointer*, uint32_t,
-                                     uint32_t)
+    static void on_pointer_axis_source(void* data, struct wl_pointer*,
+                                       uint32_t source)
     {
+        UiWayland* ui = reinterpret_cast<UiWayland*>(data);
+        ui->scroll_finger = source == WL_POINTER_AXIS_SOURCE_FINGER ||
+            source == WL_POINTER_AXIS_SOURCE_CONTINUOUS;
+    }
+
+    static void on_pointer_axis_stop(void* data, struct wl_pointer*,
+                                     uint32_t time, uint32_t axis)
+    {
+        UiWayland* ui = reinterpret_cast<UiWayland*>(data);
+        if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+            ui->scroll_stop = true;
+            ui->scroll_time = time;
+        }
     }
 
     static void on_pointer_axis_discrete(void*, struct wl_pointer*, uint32_t,
@@ -244,15 +265,20 @@ public:
     static void on_pointer_frame(void* data, struct wl_pointer*)
     {
         UiWayland* ui = reinterpret_cast<UiWayland*>(data);
-        if (ui->scroll_h || ui->scroll_v) {
+        if (ui->scroll_h || ui->scroll_v || ui->scroll_stop) {
             Application::self().add_event(AppEvent::Scroll {
                 .kmods = ui->xkb.get_modifiers(),
                 .delta_h = ui->scroll_h,
                 .delta_v = ui->scroll_v,
+                .finger = ui->scroll_finger,
+                .stop = ui->scroll_stop,
+                .time = ui->scroll_time,
             });
             ui->scroll_hires = false;
             ui->scroll_h = 0;
             ui->scroll_v = 0;
+            ui->scroll_stop = false;
+            ui->scroll_finger = false;
         }
     }
 
@@ -299,8 +325,12 @@ public:
         if (ui->scale != factor) {
             ui->scale = factor;
             const Size window = ui->get_window_size();
-            if (!ui->wnd_buffer.realloc(ui->wl.shm, window.width,
-                                        window.height)) {
+            if (ui->gl_active) {
+                ui->gl_configured = window;
+            } else if ((window.width != ui->wnd_buffer.width() ||
+                        window.height != ui->wnd_buffer.height()) &&
+                       !ui->wnd_buffer.realloc(ui->wl.shm, window.width,
+                                               window.height)) {
                 return;
             }
             Application::self().add_event(AppEvent::WindowRescale {
@@ -588,23 +618,36 @@ public:
 
     static void on_pinch_update(void* data,
                                 struct zwp_pointer_gesture_pinch_v1*, uint32_t,
-                                wl_fixed_t, wl_fixed_t, wl_fixed_t scale,
+                                wl_fixed_t dx, wl_fixed_t dy, wl_fixed_t scale,
                                 wl_fixed_t)
     {
-
         UiWayland* ui = reinterpret_cast<UiWayland*>(data);
         const double fscale = wl_fixed_to_double(scale);
         const double delta = fscale - ui->pinch_scale;
+        const double wnd_scale = ui->get_scale();
+        const double move_x = wl_fixed_to_double(dx) * wnd_scale;
+        const double move_y = wl_fixed_to_double(dy) * wnd_scale;
 
-        if (delta != 0.0) {
+        if (delta != 0.0 || move_x != 0.0 || move_y != 0.0) {
             ui->pinch_scale = fscale;
-            Application::self().add_event(AppEvent::GesturePinch { delta });
+            Application::self().add_event(AppEvent::GesturePinch {
+                .scale_delta = delta,
+                .dx = move_x,
+                .dy = move_y,
+                .end = false,
+            });
         }
     }
 
     static void on_pinch_end(void*, struct zwp_pointer_gesture_pinch_v1*,
                              uint32_t, uint32_t, int32_t)
     {
+        Application::self().add_event(AppEvent::GesturePinch {
+            .scale_delta = 0,
+            .dx = 0,
+            .dy = 0,
+            .end = true,
+        });
     }
 
     static constexpr const zwp_pointer_gesture_pinch_v1_listener
@@ -680,6 +723,22 @@ public:
 
         UiWayland* ui = reinterpret_cast<UiWayland*>(data);
         const Size window = ui->get_window_size();
+
+        if (ui->gl_active) {
+            // GPU mode: window surface is resized by the renderer
+            if (window.width == ui->gl_configured.width &&
+                window.height == ui->gl_configured.height) {
+                return;
+            }
+            ui->gl_configured = window;
+            if (ui->wl.viewport) {
+                wp_viewport_set_destination(ui->wl.viewport, ui->width,
+                                            ui->height);
+            }
+            Application::self().add_event(AppEvent::WindowResize { window });
+            Application::self().add_event(AppEvent::WindowRedraw {});
+            return;
+        }
 
         if (window.width == ui->wnd_buffer.width() &&
             window.height == ui->wnd_buffer.height()) {
@@ -879,6 +938,14 @@ void WaylandBuffer::draw_complete()
     drawn.notify_one();
 }
 
+void WaylandBuffer::wait_frame()
+{
+    if (!drawn) {
+        drawn.wait(false);
+    }
+    drawn = false;
+}
+
 void WaylandBuffer::destroy()
 {
     if (buffer) {
@@ -918,6 +985,19 @@ bool UiWayland::initialize(const std::string& app_id)
     wl.callback = wl_surface_frame(wl.surface);
     wl_callback_add_listener(wl.callback, &WaylandHandler::frame_listener,
                              this);
+
+#ifdef HAVE_GPU
+    const char* no_gpu = getenv("SWAYIMG_NO_GPU");
+    if (!no_gpu || !*no_gpu || strcmp(no_gpu, "0") == 0) {
+        gl = std::make_unique<WaylandGl>();
+        if (gl->initialize(wl.display)) {
+            gl_active = true;
+        } else {
+            Log::verbose("GPU rendering is not available");
+            gl.reset();
+        }
+    }
+#endif
 
     if (wl.datadev_mgr) {
         wl.datadev =
@@ -1040,6 +1120,8 @@ void UiWayland::run()
             // buffer flush
             if (fds[2].revents & POLLIN) {
                 flush_event.reset();
+            }
+            if ((fds[2].revents & POLLIN) && !gl_active) {
                 wl_surface_attach(wl.surface, wnd_buffer.get(), 0, 0);
                 wl_surface_damage_buffer(wl.surface, 0, 0, wnd_buffer.width(),
                                          wnd_buffer.height());
@@ -1149,8 +1231,8 @@ void UiWayland::set_window_size(const Size& size)
     width = size.width / abs_scale;
     height = size.height / abs_scale;
 
-    if (wnd_buffer.width() != size.width ||
-        wnd_buffer.height() != size.height) {
+    if (!gl_active && (wnd_buffer.width() != size.width ||
+                       wnd_buffer.height() != size.height)) {
         if (!wnd_buffer.realloc(wl.shm, size.width, size.height)) {
             return;
         }
@@ -1170,13 +1252,43 @@ Point UiWayland::get_mouse()
     return mouse_pos;
 }
 
-Pixmap* UiWayland::lock_surface()
+Canvas* UiWayland::lock_surface()
 {
-    return wnd_buffer.lock();
+#ifdef HAVE_GPU
+    if (gl_active) {
+        wnd_buffer.wait_frame();
+        const Size size = get_window_size();
+        GlCanvas* canvas = gl->begin(wl.surface, size);
+        if (canvas) {
+            return canvas;
+        }
+        // fall back to software rendering
+        Log::warning("GPU rendering failed, use software renderer");
+        gl_active = false;
+        wnd_buffer.draw_complete();
+        if (!size || !wnd_buffer.realloc(wl.shm, size.width, size.height)) {
+            return nullptr;
+        }
+    }
+#endif
+
+    Pixmap* pm = wnd_buffer.lock();
+    if (!pm) {
+        return nullptr;
+    }
+    sw_canvas.emplace(*pm);
+    return &*sw_canvas;
 }
 
 void UiWayland::commit_surface()
 {
+#ifdef HAVE_GPU
+    if (gl_active) {
+        gl->end();
+        flush_event.set(); // wake up event loop to flush display
+        return;
+    }
+#endif
     flush_event.set();
     wnd_buffer.unlock();
 }

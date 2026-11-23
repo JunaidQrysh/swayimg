@@ -186,7 +186,7 @@ public:
      * Draw text overlay on pixmap.
      * @param target destination pixmap
      */
-    void draw(Pixmap& target) const;
+    void draw(Canvas& target) const;
 
 private:
     /** Data fields to substitute. */
@@ -219,7 +219,7 @@ private:
          * @param color text color
          * @param shadow shadow color
          */
-        void draw(Pixmap& target, const Point& pos, const argb_t color,
+        void draw(Canvas& target, const Point& pos, const argb_t color,
                   const argb_t shadow) const;
 
         std::wstring text; ///< Displayed text
@@ -305,7 +305,7 @@ private:
      * @param blkpos block position
      * @param target destination pixmap (window)
      */
-    void draw(const Position blkpos, Pixmap& target) const;
+    void draw(const Position blkpos, Canvas& target) const;
 
 private:
     /** Text hide timeout. */

@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "pixmap.hpp"
+#include "canvas.hpp"
 
 class Ui {
 public:
@@ -77,6 +77,29 @@ public:
     virtual void set_window_size(const Size& /*size*/) {}
 
     /**
+     * Get window scale factor (HiDPI), ratio of buffer to logical pixels.
+     * @return scale factor
+     */
+    [[nodiscard]] virtual double get_scale() const { return 1.0; }
+
+    /**
+     * Check if window is rendered by GPU.
+     * @return true if GPU rendering is active
+     */
+    [[nodiscard]] virtual bool is_gpu() const { return false; }
+
+    /**
+     * Get native display handle (e.g. wl_display).
+     * @return display handle or nullptr
+     */
+    [[nodiscard]] virtual void* native_display() const { return nullptr; }
+
+    /**
+     * Prepare renderer in advance (e.g. compile GPU shaders).
+     */
+    virtual void warmup() {}
+
+    /**
      * Get mouse pointer position within the window.
      * @return mouse pointer coordinates
      */
@@ -84,9 +107,9 @@ public:
 
     /**
      * Begin window redraw procedure.
-     * @return window surface pixmap, nullptr if window not yet created
+     * @return window canvas, nullptr if window not yet created
      */
-    virtual Pixmap* lock_surface() = 0;
+    virtual Canvas* lock_surface() = 0;
 
     /**
      * Finalize window redraw procedure.

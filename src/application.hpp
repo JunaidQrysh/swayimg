@@ -12,6 +12,7 @@
 #include "ui.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -187,6 +188,18 @@ private:
     std::deque<AppEvent::Holder> event_queue; ///< Event queue
     std::mutex event_mutex;                   ///< Event queue mutex
     FdEvent event_notify;                     ///< Event queue notification
+
+    bool animating = false; ///< Animation is in progress
+    bool video_prewarmed = false; ///< Video player initialized
+
+    /** Animated transition between gallery and viewer modes. */
+    struct Transition {
+        bool active = false;  ///< Transition is in progress
+        bool opening = false; ///< Gallery to viewer (true) or back (false)
+        double t = 0.0;       ///< Progress
+    } transition;
+    static constexpr double TRANSITION_TIME = 0.28; ///< Duration, seconds
+    std::chrono::steady_clock::time_point last_frame; ///< Last frame time
 
     LuaEngine lua_engine;               ///< Lua engine instance
     LuaRootApi lua_bind_root;           ///< Lua bindings for root namespace

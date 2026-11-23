@@ -245,6 +245,7 @@ private:
     void set_selected_color(const luacolor_t value);
     void set_unselected_color(const luacolor_t value);
     void set_hover(const bool value);
+    void set_scroll_speed(const double value);
     void set_pstore(const bool value);
     void set_pstore_path(const std::string& value);
     void set_preload(const bool value);

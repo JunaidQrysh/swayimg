@@ -315,4 +315,115 @@ TEST_F(LayoutTest, SelectPageDown)
     ASSERT_FALSE(layout.select(Layout::PgDown));
 }
 
+TEST_F(LayoutTest, ScrollByPixels)
+{
+    InitLayout(40); // 5 columns, 8 rows, cell 15px, window 80x60
+
+    ASSERT_EQ(layout.get_scheme()[0].img->path, "exec://0");
+
+    // half a row: first row is still partially visible
+    layout.scroll_by(7, true);
+    ASSERT_EQ(layout.get_scheme()[0].img->path, "exec://0");
+    ASSERT_EQ(layout.get_scheme()[0].pos.y, 5 - 7);
+
+    // past the first row
+    layout.scroll_by(10, true);
+    ASSERT_EQ(layout.get_scheme()[0].img->path, "exec://5");
+
+    // clamp at the end: 8 rows * 15px - 60px
+    layout.scroll_by(1000, true);
+    ASSERT_EQ(layout.get_scheme().back().img->path, "exec://39");
+    ASSERT_EQ(layout.get_scheme().back().pos.y + 10, 60);
+
+    // clamp at the beginning
+    layout.scroll_by(-1000, true);
+    ASSERT_EQ(layout.get_scheme()[0].img->path, "exec://0");
+    ASSERT_EQ(layout.get_scheme()[0].pos.y, 5);
+}
+
+TEST_F(LayoutTest, KeepSelectionVisible)
+{
+    InitLayout(40);
+
+    Select(2); // row 0
+    ASSERT_FALSE(layout.keep_selection_visible());
+
+    layout.scroll_by(30, true); // rows 0 and 1 are out of view
+    ASSERT_TRUE(layout.keep_selection_visible());
+    ASSERT_EQ(layout.get_selected()->path, "exec://12"); // same column
+    ASSERT_FALSE(layout.keep_selection_visible());
+
+    layout.scroll_by(-30, true); // row 2 is still visible
+    ASSERT_FALSE(layout.keep_selection_visible());
+    layout.scroll_by(-1000, true);
+    ASSERT_TRUE(layout.keep_selection_visible() ||
+                layout.get_selected()->path == "exec://12");
+}
+
+TEST_F(LayoutTest, SmoothScroll)
+{
+    InitLayout(40);
+    layout.set_smooth(true);
+
+    ASSERT_TRUE(layout.select(Layout::Last));
+    // target is set, but position is not changed yet
+    ASSERT_EQ(layout.get_scheme()[0].img->path, "exec://0");
+    ASSERT_TRUE(layout.is_animating());
+
+    size_t frames = 0;
+    while (layout.animate(1.0 / 60.0)) {
+        ASSERT_LT(++frames, 120UL);
+    }
+    ASSERT_FALSE(layout.is_animating());
+    ASSERT_EQ(layout.get_scheme()[0].img->path, "exec://20");
+    ASSERT_EQ(layout.get_scheme().back().img->path, "exec://39");
+}
+
+TEST_F(LayoutTest, Fling)
+{
+    InitLayout(40);
+    layout.set_smooth(true);
+
+    layout.fling(2000);
+    ASSERT_TRUE(layout.is_animating());
+    size_t frames = 0;
+    while (layout.animate(1.0 / 60.0)) {
+        ASSERT_LT(++frames, 600UL);
+    }
+    // stopped at the end
+    ASSERT_EQ(layout.get_scheme().back().img->path, "exec://39");
+
+    layout.fling(-30);
+    while (layout.animate(1.0 / 60.0)) {
+        ASSERT_LT(++frames, 1200UL);
+    }
+    ASSERT_NE(layout.get_scheme().back().img->path, "exec://0");
+}
+
+TEST_F(LayoutTest, ResizeKeepsSelection)
+{
+    InitLayout(100);
+
+    Select(52);
+    const Layout::Thumbnail* before = nullptr;
+    for (const auto& it : layout.get_scheme()) {
+        if (it.img == layout.get_selected()) {
+            before = &it;
+        }
+    }
+    ASSERT_TRUE(before);
+    const ssize_t y = before->pos.y;
+
+    layout.set_window_size({ .width = 50, .height = 60 }); // 3 columns
+    ASSERT_EQ(layout.get_columns(), 3UL);
+    bool found = false;
+    for (const auto& it : layout.get_scheme()) {
+        if (it.img == layout.get_selected()) {
+            found = true;
+            ASSERT_EQ(it.pos.y, y);
+        }
+    }
+    ASSERT_TRUE(found);
+}
+
 // NOLINTEND(readability-function-cognitive-complexity)

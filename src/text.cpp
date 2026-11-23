@@ -278,20 +278,21 @@ void Text::update()
     }
 }
 
-void Text::draw(Pixmap& target) const
+void Text::draw(Canvas& target) const
 {
+    const Size tsz = target.size();
     // show status message
     if (status_tm.show && !status.lines.empty()) {
-        Point pos(0, target.height() - status.height - padding);
+        Point pos(0, tsz.height - status.height - padding);
         if (background.a != argb_t::min) {
             // draw background
-            pos.x = target.width() / 2 - status.width / 2;
+            pos.x = tsz.width / 2 - status.width / 2;
             target.fill_blend({ pos.x, pos.y, status.width, status.height },
                               background);
         }
         // draw status text
         for (const auto& line : status.lines) {
-            pos.x = target.width() / 2 - line.width() / 2;
+            pos.x = tsz.width / 2 - line.width() / 2;
             line.draw(target, pos, foreground, shadow);
             pos.y += status.line_height;
         }
@@ -314,8 +315,9 @@ void Text::recalc()
     Application::redraw();
 }
 
-void Text::draw(const Position blkpos, Pixmap& target) const
+void Text::draw(const Position blkpos, Canvas& target) const
 {
+    const Size tsz = target.size();
     const KeyValBlock& block = blocks[static_cast<size_t>(blkpos)];
 
     // calculate initial position
@@ -327,19 +329,19 @@ void Text::draw(const Position blkpos, Pixmap& target) const
             y = padding;
             break;
         case Position::TopRight:
-            x = static_cast<ssize_t>(target.width()) - block.total_width -
+            x = static_cast<ssize_t>(tsz.width) - block.total_width -
                 padding;
             y = padding;
             break;
         case Position::BottomLeft:
             x = padding;
-            y = static_cast<ssize_t>(target.height()) - block.total_height -
+            y = static_cast<ssize_t>(tsz.height) - block.total_height -
                 padding;
             break;
         case Position::BottomRight:
-            x = static_cast<ssize_t>(target.width()) - block.total_width -
+            x = static_cast<ssize_t>(tsz.width) - block.total_width -
                 padding;
-            y = static_cast<ssize_t>(target.height()) - block.total_height -
+            y = static_cast<ssize_t>(tsz.height) - block.total_height -
                 padding;
             break;
     }
@@ -404,10 +406,10 @@ size_t Text::TextLine::margin() const
     return height() / MARGIN_FACTOR;
 }
 
-void Text::TextLine::draw(Pixmap& target, const Point& pos, const argb_t color,
+void Text::TextLine::draw(Canvas& target, const Point& pos, const argb_t color,
                           const argb_t shadow) const
 {
-    const ssize_t max_x = target.width();
+    const ssize_t max_x = target.size().width;
 
     Point pt = pos;
     pt.x += margin();

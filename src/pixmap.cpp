@@ -4,6 +4,14 @@
 
 #include "pixmap.hpp"
 
+#include <atomic>
+
+void Pixmap::touch()
+{
+    static std::atomic<uint64_t> counter = 0;
+    pm_id = ++counter;
+}
+
 Pixmap::Pixmap(const Format format, const size_t width, const size_t height,
                void* data) noexcept
 {
@@ -13,6 +21,7 @@ Pixmap::Pixmap(const Format format, const size_t width, const size_t height,
 void Pixmap::create(const Format format, const size_t width,
                     const size_t height)
 {
+    touch();
     pm_format = format;
     pm_width = width;
     pm_height = height;
@@ -36,6 +45,7 @@ void Pixmap::create(const Format format, const size_t width,
 void Pixmap::attach(const Format format, const size_t width,
                     const size_t height, void* data, const size_t stride)
 {
+    touch();
     pm_format = format;
     pm_width = width;
     pm_height = height;
@@ -58,6 +68,7 @@ void Pixmap::attach(const Format format, const size_t width,
 
 void Pixmap::free()
 {
+    pm_id = 0;
     pm_width = 0;
     pm_height = 0;
     pm_bpp = 0;
@@ -83,6 +94,7 @@ Pixmap Pixmap::submap(const Rectangle& rect)
 
 void Pixmap::flip_vertical()
 {
+    touch();
     assert(format() == Format::RGB || format() == Format::ARGB);
 
     const size_t line_sz = pm_width * pm_bpp;
@@ -100,6 +112,7 @@ void Pixmap::flip_vertical()
 
 void Pixmap::flip_horizontal()
 {
+    touch();
     assert(format() == Format::RGB || format() == Format::ARGB);
 
     argb_t* pixdata = reinterpret_cast<argb_t*>(ptr(0, 0));
@@ -116,6 +129,7 @@ void Pixmap::flip_horizontal()
 
 void Pixmap::rotate(const size_t angle)
 {
+    touch();
     assert(format() == Format::RGB || format() == Format::ARGB);
     assert(angle == 90 || angle == 180 || angle == 270);
 
@@ -161,6 +175,7 @@ void Pixmap::rotate(const size_t angle)
 
 void Pixmap::fill(const Rectangle& rect, const argb_t& color)
 {
+    touch();
     assert(format() == Format::RGB || format() == Format::ARGB);
 
     const Rectangle visible = rect.intersect({ 0, 0, pm_width, pm_height });
@@ -187,6 +202,7 @@ void Pixmap::fill(const Rectangle& rect, const argb_t& color)
 
 void Pixmap::fill_blend(const Rectangle& rect, const argb_t& color)
 {
+    touch();
     assert(format() == Format::ARGB);
 
     const Rectangle visible = rect.intersect({ 0, 0, pm_width, pm_height });
@@ -226,6 +242,7 @@ void Pixmap::fill_blend(const Rectangle& rect, const argb_t& color)
 void Pixmap::grid(const Rectangle& rect, const size_t size, const argb_t& clr0,
                   const argb_t& clr1)
 {
+    touch();
     assert(format() == Format::ARGB);
 
     const Rectangle visible = rect.intersect({ 0, 0, pm_width, pm_height });
@@ -288,6 +305,7 @@ void Pixmap::rectangle(const Rectangle& rect, const argb_t& color,
 
 void Pixmap::mask(const Pixmap& pm, const Point& pos, const argb_t& color)
 {
+    touch();
     assert(format() == Format::RGB || format() == Format::ARGB);
     assert(pm.format() == Format::GS);
 
@@ -320,6 +338,7 @@ void Pixmap::mask(const Pixmap& pm, const Point& pos, const argb_t& color)
 
 void Pixmap::copy(const Pixmap& pm, const Point& pos)
 {
+    touch();
     assert(format() == Format::RGB || format() == Format::ARGB);
     assert(pm.format() == Format::RGB || pm.format() == Format::ARGB);
 
@@ -342,6 +361,7 @@ void Pixmap::copy(const Pixmap& pm, const Point& pos)
 
 void Pixmap::blend(const Pixmap& pm, const Point& pos)
 {
+    touch();
     assert(format() == Format::RGB || format() == Format::ARGB);
     assert(pm.format() == Format::RGB || pm.format() == Format::ARGB);
     assert(format() == Format::ARGB || pm.format() == Format::ARGB);

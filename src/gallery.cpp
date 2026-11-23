@@ -6,14 +6,19 @@
 
 #include "application.hpp"
 #include "defaults.hpp"
+#include "fdothumb.hpp"
 #include "formatfactory.hpp"
 #include "imagelist.hpp"
 #include "render.hpp"
 #include "resources.hpp"
 #include "text.hpp"
+#include "videoplayer.hpp"
 
 #include <sys/stat.h>
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <format>
 #include <utility>
@@ -27,6 +32,28 @@ constexpr double SSCALE_MAX = 10.0;
 
 // Number of threads used for loading thumbnails
 constexpr size_t THUMB_LOAD_THREADS = 4;
+
+// Max time to wait for visible thumbnails before the first frame
+constexpr std::chrono::milliseconds WARMUP_TIMEOUT(150);
+
+// Animation durations in seconds
+constexpr double FADE_TIME = 0.18;
+constexpr double SELECT_TIME = 0.12;
+
+// Touchpad scroll: pixels per scroll unit (wayland axis value / 16)
+constexpr double FINGER_SCROLL_FACTOR = 16.0;
+// Fling: min and max velocity (pixels per second)
+constexpr double FLING_MIN_VELOCITY = 300.0;
+constexpr double FLING_MAX_VELOCITY = 20000.0;
+// Mouse wheel: scroll distance for one step relative to thumbnail size
+constexpr double WHEEL_SCROLL_FACTOR = 0.6;
+
+/** Ease out cubic. */
+static double ease_out(const double t)
+{
+    const double inv = 1.0 - std::clamp(t, 0.0, 1.0);
+    return 1.0 - inv * inv * inv;
+}
 
 // Service records in the thumbnail meta block
 constexpr const char* THUMB_META_INODE = "swayimg.inode";
@@ -56,6 +83,8 @@ Gallery::Gallery()
     mark_color = Defaults::gallery::mark_color;
     pinch_factor = Defaults::gallery::pinch_factor;
 
+    layout.set_smooth(true);
+
     text_scheme[static_cast<size_t>(Text::TopLeft)].assign(
         Defaults::gallery::text_scheme_tl.begin(),
         Defaults::gallery::text_scheme_tl.end());
@@ -73,7 +102,9 @@ bool Gallery::select(const Layout::Direction dir)
     if (!layout.get_selected() || !layout.select(dir)) {
         return false;
     }
+    free_scroll = false;
     refresh();
+    Application::redraw();
     switch_current();
     return true;
 }
@@ -180,6 +211,11 @@ void Gallery::set_window_color(const argb_t& color)
     }
 }
 
+void Gallery::set_scroll_speed(const double speed)
+{
+    scroll_speed = std::clamp(speed, 0.1, 10.0);
+}
+
 void Gallery::enable_hover(const bool enable)
 {
     hover_select = enable;
@@ -211,20 +247,45 @@ void Gallery::set_pstore_path(const std::filesystem::path& path)
     pstore_path = path;
 }
 
-void Gallery::initialize() {}
+void Gallery::initialize()
+{
+    Application::self().add_fdpoll(warmup_timer, [this] {
+        warmup_timer.reset(0, 0);
+        Application::redraw();
+    });
+}
 
 void Gallery::activate(const ImageEntryPtr& entry, const Size& wnd)
 {
     AppMode::activate(entry, wnd);
     layout.select(entry && !entry->removed ? entry : nullptr);
     layout.set_window_size(wnd);
+
+    // postpone the first frame until visible thumbnails are loaded
+    warmup = true;
+    warmup_end = std::chrono::steady_clock::now() + WARMUP_TIMEOUT;
+    warmup_timer.reset(WARMUP_TIMEOUT.count(), 0);
+    {
+        const std::scoped_lock lock(mutex);
+        fade.clear();
+    }
+
     set_current(entry);
+
+    // no selection animation on activation
+    sel_last = layout.get_selected();
+    sel_prev = nullptr;
+    sel_anim = 1.0;
+    free_scroll = false;
 }
 
 void Gallery::deactivate()
 {
     tpool.cancel();
     tpool.wait();
+    warmup = false;
+    warmup_timer.reset(0, 0);
+    layout.stop_scroll();
 }
 
 ImageEntryPtr Gallery::get_current()
@@ -246,7 +307,7 @@ void Gallery::window_resize(const Size& wnd)
     refresh();
 }
 
-void Gallery::window_redraw(Pixmap& wnd)
+void Gallery::window_redraw(Canvas& wnd)
 {
     const ImageEntryPtr current = layout.get_selected();
     if (!current) {
@@ -254,21 +315,27 @@ void Gallery::window_redraw(Pixmap& wnd)
         return;
     }
 
-    wnd.fill({ 0, 0, wnd.width(), wnd.height() }, clr_window);
+    wnd.fill({ 0, 0, wnd.size().width, wnd.size().height }, clr_window);
 
+    // draw all exclude the currently and previously selected (on top)
     const auto& scheme = layout.get_scheme();
-    size_t selected_scheme_idx = 0;
-    size_t i = 0;
-    // draw all exclude the currently selected
+    const Layout::Thumbnail* tsel = nullptr;
+    const Layout::Thumbnail* tprev = nullptr;
     for (const auto& it : scheme) {
         if (it.img == current) {
-            selected_scheme_idx = i;
+            tsel = &it;
+        } else if (it.img == sel_prev && sel_anim < 1.0) {
+            tprev = &it;
         } else {
             draw(it, wnd);
-            i++;
         }
     }
-    draw(scheme[selected_scheme_idx], wnd);
+    if (tprev) {
+        draw(*tprev, wnd);
+    }
+    if (tsel) {
+        draw(*tsel, wnd);
+    }
 }
 
 void Gallery::handle_mmove(const InputMouse&, const Point& pos, const Point&)
@@ -278,7 +345,8 @@ void Gallery::handle_mmove(const InputMouse&, const Point& pos, const Point&)
     }
 }
 
-void Gallery::handle_pinch(const double scale_delta)
+void Gallery::handle_pinch(const double scale_delta, const double /*dx*/,
+                           const double /*dy*/)
 {
     const size_t size_factor =
         std::max(get_thumb_size(), static_cast<size_t>(100));
@@ -319,22 +387,28 @@ void Gallery::handle_imagelist(const ImageListEvent event,
     Application::redraw();
 }
 
-void Gallery::draw(const Layout::Thumbnail& tlay, Pixmap& wnd)
+Rectangle Gallery::tile_rect(const Layout::Thumbnail& tlay,
+                             const Size& wnd_size) const
 {
-    const std::scoped_lock lock(mutex);
-
     const bool selected = (tlay.img == layout.get_selected());
-    const Size wnd_size = wnd;
     const size_t tile_size = layout.get_thumb_size();
-    const Pixmap* pm = get_thumbnail(tlay.img);
+
+    // animated scale of the selected and previously selected tiles
+    double tile_scale = 1.0;
+    if (selected) {
+        tile_scale += (selected_scale - 1.0) *
+            (tlay.img == sel_last ? ease_out(sel_anim) : 1.0);
+    } else if (tlay.img == sel_prev && sel_anim < 1.0) {
+        tile_scale += (selected_scale - 1.0) * ease_out(1.0 - sel_anim);
+    }
 
     // calculate tile position/size
     Rectangle tile {
         tlay.pos, { .width = tile_size, .height = tile_size }
     };
-    if (selected) {
-        tile.width *= selected_scale;
-        tile.height *= selected_scale;
+    if (tile_scale != 1.0) {
+        tile.width *= tile_scale;
+        tile.height *= tile_scale;
         tile.x -= tile.width / 2 - tile_size / 2;
         tile.y -= tile.height / 2 - tile_size / 2;
 
@@ -352,6 +426,36 @@ void Gallery::draw(const Layout::Thumbnail& tlay, Pixmap& wnd)
             tile.y = border_size;
         }
     }
+
+    return tile;
+}
+
+Rectangle Gallery::get_tile_rect(const ImageEntryPtr& entry,
+                                 const Size& wnd_size) const
+{
+    for (const auto& it : layout.get_scheme()) {
+        if (it.img == entry) {
+            return tile_rect(it, wnd_size);
+        }
+    }
+    return {};
+}
+
+void Gallery::draw(const Layout::Thumbnail& tlay, Canvas& wnd)
+{
+    const std::scoped_lock lock(mutex);
+
+    const bool selected = (tlay.img == layout.get_selected());
+    const Pixmap* pm = get_thumbnail(tlay.img);
+
+    // fade-in of newly loaded thumbnail
+    double opacity = 1.0;
+    const auto fade_it = fade.find(tlay.img);
+    if (fade_it != fade.end()) {
+        opacity = ease_out(fade_it->second);
+    }
+
+    const Rectangle tile = tile_rect(tlay, wnd.size());
 
     // draw background
     Rectangle bkg = tile;
@@ -382,8 +486,8 @@ void Gallery::draw(const Layout::Thumbnail& tlay, Pixmap& wnd)
                 static_cast<ssize_t>(scale * pm->height()) / 2,
         };
 
-        Pixmap sub = wnd.submap(tile);
-        Render::self().draw(sub, *pm, pos, scale);
+        wnd.draw(*pm, { .x = tile.x + pos.x, .y = tile.y + pos.y }, scale, tile,
+                 opacity);
     } else if (bkg.width > Resource::file.width() &&
                bkg.height > Resource::file.height()) {
         // draw icon
@@ -393,6 +497,15 @@ void Gallery::draw(const Layout::Thumbnail& tlay, Pixmap& wnd)
             static_cast<ssize_t>(Resource::file.height() / 2);
         wnd.mask(Resource::file, { .x = x, .y = y },
                  { 0x20, 0xff, 0xff, 0xff });
+    }
+
+    // draw video label
+    if (VideoPlayer::is_video(tlay.img) &&
+        bkg.width > Resource::video.width() * 2 &&
+        bkg.height > Resource::video.height() * 2) {
+        const ssize_t margin = 5;
+        wnd.mask(Resource::video, { .x = bkg.x + margin, .y = bkg.y + margin },
+                 { 0xa0, argb_t::max, argb_t::max, argb_t::max });
     }
 
     // draw border
@@ -419,8 +532,165 @@ void Gallery::draw(const Layout::Thumbnail& tlay, Pixmap& wnd)
 void Gallery::refresh()
 {
     const std::scoped_lock lock(mutex);
+    update_visible();
     clear_invisible();
     requeue_loading();
+}
+
+void Gallery::update_visible()
+{
+    const auto& scheme = layout.get_scheme();
+    if (scheme.empty()) {
+        visible_first = 1;
+        visible_last = 0;
+    } else {
+        visible_first = scheme.front().img->index;
+        visible_last = scheme.back().img->index;
+    }
+}
+
+void Gallery::on_scrolled()
+{
+    const auto& scheme = layout.get_scheme();
+    const size_t first = scheme.empty() ? 1 : scheme.front().img->index;
+    const size_t last = scheme.empty() ? 0 : scheme.back().img->index;
+    if (first != visible_first || last != visible_last) {
+        refresh();
+    }
+}
+
+bool Gallery::ready_to_draw()
+{
+    if (!warmup) {
+        return true;
+    }
+
+    bool ready = std::chrono::steady_clock::now() >= warmup_end;
+    if (!ready) {
+        ready = true;
+        const std::scoped_lock lock(mutex);
+        for (const auto& it : layout.get_scheme()) {
+            if (!thumbs.contains(it.img)) {
+                ready = false;
+                break;
+            }
+        }
+    }
+
+    if (ready) {
+        warmup = false;
+        warmup_timer.reset(0, 0);
+    }
+    return ready;
+}
+
+bool Gallery::animate(const double dt)
+{
+    bool in_progress = false;
+
+    // scrolling
+    if (layout.is_animating()) {
+        in_progress = layout.animate(dt);
+        if (free_scroll && layout.keep_selection_visible()) {
+            follow_selection();
+        }
+        on_scrolled();
+    }
+
+    // selection
+    if (sel_anim < 1.0) {
+        sel_anim = std::min(1.0, sel_anim + dt / SELECT_TIME);
+        in_progress |= sel_anim < 1.0;
+    }
+
+    // fade-in
+    const std::scoped_lock lock(mutex);
+    for (auto it = fade.begin(); it != fade.end();) {
+        it->second += dt / FADE_TIME;
+        if (it->second >= 1.0) {
+            it = fade.erase(it);
+        } else {
+            in_progress = true;
+            ++it;
+        }
+    }
+
+    return in_progress;
+}
+
+void Gallery::scroll(const double delta)
+{
+    if (!layout.get_selected()) {
+        return;
+    }
+
+    free_scroll = true;
+
+    if (scroll_finger) {
+        // touchpad: follow the finger, track velocity for kinetic scrolling
+        // touchpad deltas are in logical pixels, layout uses buffer pixels
+        const double distance = delta * FINGER_SCROLL_FACTOR * scroll_speed *
+            Application::get_ui()->get_scale();
+
+        // new gesture: remember velocity of the running fling (stacking)
+        if (fling_tracker.empty()) {
+            fling_carry = layout.get_velocity();
+        }
+
+        layout.scroll_by(distance, true);
+
+        // keep recent samples (compositor timestamps) for fling velocity
+        fling_tracker.add(scroll_time, 0, distance);
+
+        if (layout.keep_selection_visible()) {
+            follow_selection();
+        }
+        on_scrolled();
+    } else {
+        // mouse wheel: animated scroll
+        layout.scroll_by(delta * layout.get_thumb_size() * WHEEL_SCROLL_FACTOR,
+                         false);
+    }
+
+    Application::redraw();
+}
+
+void Gallery::handle_scroll_stop()
+{
+    double velocity = fling_tracker.release(scroll_time).second;
+
+    // repeated flicks in the same direction accelerate scrolling
+    if (fling_carry != 0 && (fling_carry > 0) == (velocity > 0) &&
+        std::abs(velocity) >= FLING_MIN_VELOCITY) {
+        velocity += fling_carry;
+    }
+    fling_carry = 0;
+
+    if (std::abs(velocity) >= FLING_MIN_VELOCITY) {
+        velocity = std::clamp(velocity, -FLING_MAX_VELOCITY,
+                              FLING_MAX_VELOCITY);
+        layout.fling(velocity);
+        Application::redraw();
+    }
+}
+
+void Gallery::follow_selection()
+{
+    AppMode::switch_current();
+    sel_last = layout.get_selected();
+    sel_prev = nullptr;
+    sel_anim = 1.0;
+}
+
+void Gallery::switch_current()
+{
+    const ImageEntryPtr current = layout.get_selected();
+    if (current != sel_last) {
+        sel_prev = sel_last;
+        sel_last = current;
+        sel_anim = 0.0;
+    }
+    AppMode::switch_current();
 }
 
 void Gallery::requeue_loading()
@@ -518,7 +788,16 @@ void Gallery::load_thumbnail(const ImageEntryPtr& entry)
 
     Pixmap pm;
 
-    if (pstore_enable && !entry->is_special()) {
+    // try freedesktop thumbnail cache (x-large: up to 1024px)
+    if (!entry->is_special() && thumb_size <= 1024) {
+        const Pixmap fdo = FdoThumb::load(entry->path);
+        if (fdo) {
+            pm = ImageFormat::make_thumb(fdo, thumb_size,
+                                         aspect == Aspect::Fill);
+        }
+    }
+
+    if (!pm && pstore_enable && !entry->is_special()) {
         pm = pstore_load(entry);
     }
 
@@ -536,7 +815,11 @@ void Gallery::load_thumbnail(const ImageEntryPtr& entry)
     crld_thumbs.erase(entry);
     if (pm) {
         thumbs.insert_or_assign(entry, pm);
-        if (layout.is_visible(entry)) {
+        const size_t index = entry->index;
+        if (index >= visible_first && index <= visible_last) {
+            if (!warmup) {
+                fade.insert_or_assign(entry, 0.0); // animate appearance
+            }
             Application::redraw();
         }
     }

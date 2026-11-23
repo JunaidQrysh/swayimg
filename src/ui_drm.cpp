@@ -168,9 +168,9 @@ Size UiDrm::get_window_size()
     return pm;
 }
 
-Pixmap* UiDrm::lock_surface()
+Canvas* UiDrm::lock_surface()
 {
-    return &pm;
+    return &canvas;
 }
 
 void UiDrm::commit_surface()

@@ -5,10 +5,15 @@
 #pragma once
 
 #include "appmode.hpp"
+#include "fdevent.hpp"
+#include "fling.hpp"
 #include "image.hpp"
 #include "layout.hpp"
 #include "threadpool.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <deque>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -120,6 +125,12 @@ public:
     void enable_hover(const bool enable);
 
     /**
+     * Set touchpad scroll speed.
+     * @param speed multiplier of finger movement
+     */
+    void set_scroll_speed(const double speed);
+
+    /**
      * Set number of thumbnails stored in memory cache.
      * @param size max number of thumbnails stored in memory cache
      */
@@ -150,10 +161,38 @@ public:
     ImageEntryPtr get_current() override;
     bool set_current(const ImageEntryPtr& entry) override;
     void window_resize(const Size& wnd) override;
-    void window_redraw(Pixmap& wnd) override;
+    void window_redraw(Canvas& wnd) override;
     void handle_mmove(const InputMouse& input, const Point& pos,
                       const Point& delta) override;
-    void handle_pinch(const double scale_delta) override;
+    void handle_pinch(const double scale_delta, const double dx,
+                      const double dy) override;
+    bool ready_to_draw() override;
+    bool animate(const double dt) override;
+
+    /**
+     * Scroll the gallery (mouse wheel or touchpad).
+     * @param delta scroll delta (wheel steps, fractional for touchpad)
+     */
+    void scroll(const double delta);
+
+    /**
+     * Get tile of the image thumbnail on the window.
+     * @param entry image entry
+     * @param wnd_size window size
+     * @return tile rectangle, empty if image is not visible
+     */
+    [[nodiscard]] Rectangle get_tile_rect(const ImageEntryPtr& entry,
+                                          const Size& wnd_size) const;
+
+    /**
+     * Check if thumbnails cover the tile (cropped to square).
+     * @return true if thumbnail covers the tile, false if fit
+     */
+    [[nodiscard]] bool thumb_cover() const { return aspect == Aspect::Fill; }
+
+protected:
+    void switch_current() override;
+    void handle_scroll_stop() override;
     void handle_imagelist(const ImageListEvent event,
                           const std::vector<ImageEntryPtr>& entries) override;
 
@@ -163,12 +202,36 @@ private:
      * @param tlay thumbnail layout description
      * @param wnd target window
      */
-    void draw(const Layout::Thumbnail& tlay, Pixmap& wnd);
+    void draw(const Layout::Thumbnail& tlay, Canvas& wnd);
+
+    /**
+     * Get tile rectangle of the thumbnail (including selection scale).
+     * @param tlay thumbnail layout description
+     * @param wnd_size window size
+     * @return tile rectangle
+     */
+    [[nodiscard]] Rectangle tile_rect(const Layout::Thumbnail& tlay,
+                                      const Size& wnd_size) const;
 
     /**
      * Refresh view: clear and load thumbnails.
      */
     void refresh();
+
+    /**
+     * Update visible range and reload thumbnails if visible area changed.
+     */
+    void on_scrolled();
+
+    /**
+     * Update range of visible images (used by loader threads).
+     */
+    void update_visible();
+
+    /**
+     * Switch current image after selection followed scrolling (no animation).
+     */
+    void follow_selection();
 
     /**
      * Rebuild loading queue.
@@ -219,6 +282,7 @@ private:
     argb_t clr_border;     ///< Selected tile border
 
     bool hover_select; ///< Mouse hover selection
+    double scroll_speed = 1.5; ///< Touchpad scroll speed multiplier
 
     ThreadPool tpool; ///< Loading threads
 
@@ -227,6 +291,23 @@ private:
 
     std::unordered_map<ImageEntryPtr, Pixmap> thumbs; ///< Loaded thumbnails
     std::set<ImageEntryPtr> crld_thumbs; ///< Currently loading thumbnails
+
+    std::atomic<size_t> visible_first = 1; ///< First visible image index
+    std::atomic<size_t> visible_last = 0;  ///< Last visible image index
+
+    // hold the first frame until visible thumbnails are loaded
+    std::atomic<bool> warmup = false; ///< Waiting for visible thumbnails
+    std::chrono::steady_clock::time_point warmup_end; ///< Warmup deadline
+    FdTimer warmup_timer; ///< Timer to finish warmup
+
+    // animations
+    std::unordered_map<ImageEntryPtr, double> fade; ///< Fade-in progress
+    ImageEntryPtr sel_last;  ///< Currently selected (animated) entry
+    ImageEntryPtr sel_prev;  ///< Previously selected entry
+    double sel_anim = 1.0;   ///< Selection animation progress
+    bool free_scroll = false; ///< Scrolling by wheel/touchpad (not keyboard)
+    FlingTracker fling_tracker; ///< Touchpad fling velocity estimation
+    double fling_carry = 0; ///< Fling velocity interrupted by a new gesture
 
     bool preload;      ///< Enable/disable preloading of invisible thumbnails
     size_t cache_size; ///< Max number of thumbnails in cache

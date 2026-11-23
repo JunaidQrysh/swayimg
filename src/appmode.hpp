@@ -83,7 +83,21 @@ public:
      * Window resize handler.
      * @param wnd window surface pixmap
      */
-    virtual void window_redraw(Pixmap& wnd) = 0;
+    virtual void window_redraw(Canvas& wnd) = 0;
+
+    /**
+     * Check if mode is ready to draw a frame. Used to postpone the first
+     * frame until the essential content is loaded.
+     * @return false to skip redraw (the previous frame stays on the screen)
+     */
+    virtual bool ready_to_draw() { return true; }
+
+    /**
+     * Advance animations, called before each window redraw.
+     * @param dt time since previous frame in seconds
+     * @return true if animation is in progress and next frame is required
+     */
+    virtual bool animate(const double /*dt*/) { return false; }
 
     /**
      * Handle key press event.
@@ -95,9 +109,13 @@ public:
      * Handle mouse/touchpad scroll.
      * @param kmods keyboard modifiers state
      * @param delta_h,delta_v horizontal and vertical scroll delta
+     * @param finger true if scroll source is a finger on touchpad
+     * @param stop true if scrolling stopped (finger lifted)
+     * @param time event timestamp in milliseconds
      */
     void handle_scroll(const keymod_t kmods, const double delta_h,
-                       const double delta_v) const;
+                       const double delta_v, const bool finger,
+                       const bool stop, const uint32_t time);
 
     /**
      * Handle mouse click.
@@ -119,7 +137,26 @@ public:
      * Handle pinch gesture.
      * @param scale_delta scale diff
      */
-    virtual void handle_pinch(const double scale_delta) = 0;
+    virtual void handle_pinch(const double scale_delta, const double dx,
+                              const double dy) = 0;
+
+    /**
+     * Handle end of pinch gesture.
+     */
+    virtual void handle_pinch_end() {}
+
+    /**
+     * Handle raw mouse button event before key bindings.
+     * @param button changed button
+     * @param pressed true if pressed, false if released
+     * @param pos mouse pointer coordinates
+     * @return true if event was consumed
+     */
+    virtual bool handle_mbutton(const InputMouse::mouse_btn_t /*button*/,
+                                const bool /*pressed*/, const Point& /*pos*/)
+    {
+        return false;
+    }
 
     /**
      * Handle signal.
@@ -205,14 +242,21 @@ protected:
     virtual void switch_current();
 
     /**
+     * Handle end of touchpad scroll (finger lifted).
+     */
+    virtual void handle_scroll_stop() {}
+
+    /**
      * Draw placeholder for empty image list.
      * @param wnd window surface pixmap
      * @param bkg window background color
      */
-    static void draw_empty(Pixmap& wnd, const argb_t bkg);
+    static void draw_empty(Canvas& wnd, const argb_t bkg);
 
 protected:
     argb_t mark_color;                       ///< Mark icon color
+    bool scroll_finger = false; ///< Current scroll comes from touchpad
+    uint32_t scroll_time = 0;   ///< Current scroll event timestamp (ms)
     double pinch_factor;                     ///< Pinch gesture factor
     std::array<Text::Scheme, 4> text_scheme; ///< Text layer scheme
 

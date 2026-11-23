@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "swcanvas.hpp"
 #include "ui.hpp"
 
 #pragma GCC diagnostic push
@@ -29,7 +30,7 @@ public:
 
     // Implementation of UI generic interface
     Size get_window_size() override;
-    Pixmap* lock_surface() override;
+    Canvas* lock_surface() override;
     void commit_surface() override;
 
 private:
@@ -105,4 +106,5 @@ private:
     FrameBuffer fb[2];          ///< Frame buffers
     FrameBuffer* cfb = nullptr; ///< Currently displayed frame buffer
     Pixmap pm;                  ///< Currently displayed pixmap
+    SwCanvas canvas { pm };     ///< Canvas to draw on the pixmap
 };

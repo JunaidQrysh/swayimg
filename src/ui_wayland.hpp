@@ -6,8 +6,14 @@
 
 #include "fdevent.hpp"
 #include "input.hpp"
+#include "swcanvas.hpp"
 #include "ui.hpp"
 #include "xkb.hpp"
+
+#include "buildconf.hpp"
+#ifdef HAVE_GPU
+#include "ui_wayland_gl.hpp"
+#endif
 
 #include <content-type-v1-client-protocol.h>
 #include <cursor-shape-v1-client-protocol.h>
@@ -20,7 +26,9 @@
 
 #include <atomic>
 #include <cassert>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 /** Generic Wayland object. */
@@ -118,6 +126,11 @@ struct WaylandBuffer {
     void draw_complete();
 
     /**
+     * Wait until previous frame is finished rendering by compositor.
+     */
+    void wait_frame();
+
+    /**
      * Get buffer width.
      * @return buffer width in pixels
      */
@@ -171,7 +184,24 @@ public:
     Size get_window_size() override;
     void set_window_size(const Size& size) override;
     Point get_mouse() override;
-    Pixmap* lock_surface() override;
+    [[nodiscard]] double get_scale() const override
+    {
+        return static_cast<double>(scale) / FRACTION_SCALE_DEN;
+    }
+    [[nodiscard]] bool is_gpu() const override { return gl_active; }
+    void warmup() override
+    {
+#ifdef HAVE_GPU
+        if (gl_active) {
+            gl->warmup();
+        }
+#endif
+    }
+    [[nodiscard]] void* native_display() const override
+    {
+        return wl.display.ptr;
+    }
+    Canvas* lock_surface() override;
     void commit_surface() override;
 
 private:
@@ -216,6 +246,13 @@ private:
     } wl;
 
     WaylandBuffer wnd_buffer; ///< Window buffer
+    std::optional<SwCanvas> sw_canvas; ///< Software canvas for window buffer
+
+#ifdef HAVE_GPU
+    std::unique_ptr<WaylandGl> gl; ///< GPU renderer
+#endif
+    std::atomic<bool> gl_active = false; ///< GPU renderer is used
+    Size gl_configured;                  ///< Last configured size (GPU mode)
 
     uint32_t scale = FRACTION_SCALE_DEN; ///< Window scale factor (WL format)
 
@@ -231,6 +268,9 @@ private:
     bool scroll_hires = false; ///< Scroll mode (hires/lores)
     double scroll_v = 0;       ///< Pending vertical scroll
     double scroll_h = 0;       ///< Pending horizontal scroll
+    bool scroll_finger = false; ///< Scroll source is finger (touchpad)
+    bool scroll_stop = false;   ///< Scroll stop (finger lifted)
+    uint32_t scroll_time = 0;   ///< Timestamp of the last scroll event (ms)
 
     double pinch_scale; ///< Last pinch scale
 

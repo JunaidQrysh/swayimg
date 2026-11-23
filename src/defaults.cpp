@@ -77,6 +77,28 @@ void Defaults::viewer::bind_inputs(Viewer* mode)
                          Application::redraw();
                      });
 
+    // embedded video playback
+    mode->bind_input(
+        InputKeyboard { .key = XKB_KEY_space, .mods = KEYMOD_NONE }, [mode] {
+            mode->video_pause();
+        });
+    mode->bind_input(
+        InputKeyboard { .key = XKB_KEY_Left, .mods = KEYMOD_SHIFT }, [mode] {
+            mode->video_seek(-5);
+        });
+    mode->bind_input(
+        InputKeyboard { .key = XKB_KEY_Right, .mods = KEYMOD_SHIFT }, [mode] {
+            mode->video_seek(5);
+        });
+    mode->bind_input(
+        InputKeyboard { .key = XKB_KEY_Up, .mods = KEYMOD_SHIFT }, [mode] {
+            mode->video_volume(5);
+        });
+    mode->bind_input(
+        InputKeyboard { .key = XKB_KEY_Down, .mods = KEYMOD_SHIFT }, [mode] {
+            mode->video_volume(-5);
+        });
+
     // image transform
     mode->bind_input(
         InputKeyboard { .key = XKB_KEY_bracketleft, .mods = KEYMOD_NONE },
@@ -145,10 +167,11 @@ void Defaults::viewer::bind_inputs(Viewer* mode)
         });
 
     // scale
-    const auto zoom_fn = [mode](const double factor,
-                                const Point& pos = Point()) {
+    // zoom around mouse pointer (window center if pointer is unknown)
+    const auto zoom_fn = [mode](const double factor) {
         const double scale = mode->get_scale();
-        mode->set_scale(scale + scale / factor, pos);
+        mode->set_scale(scale + scale / factor,
+                        Application::get_ui()->get_mouse());
     };
     mode->bind_input(
         InputKeyboard { .key = XKB_KEY_equal, .mods = KEYMOD_NONE }, [zoom_fn] {
@@ -236,10 +259,7 @@ void Defaults::viewer::bind_inputs(Viewer* mode)
             const double scale = mode->get_scale();
             mode->set_scale(scale - scale * delta_v / 10.0, pos);
         } else {
-            Point pos = mode->get_position();
-            pos.x += static_cast<ssize_t>(delta_h * 50.0);
-            pos.y += static_cast<ssize_t>(delta_v * 50.0);
-            mode->set_position(pos);
+            mode->pan(delta_h, delta_v);
         }
     };
 }
@@ -421,11 +441,10 @@ void Defaults::gallery::bind_inputs(Gallery* mode)
                 zoom_fn(-delta_v / 16.0);
             }
         } else {
-            if (delta_h) {
-                mode->select(delta_h > 0 ? Layout::Right : Layout::Left);
-            }
             if (delta_v) {
-                mode->select(delta_v > 0 ? Layout::Down : Layout::Up);
+                mode->scroll(delta_v);
+            } else if (delta_h) {
+                mode->select(delta_h > 0 ? Layout::Right : Layout::Left);
             }
         }
     };

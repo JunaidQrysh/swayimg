@@ -39,10 +39,16 @@ void AppMode::handle_keyboard(const InputKeyboard& input)
 }
 
 void AppMode::handle_scroll(const keymod_t kmods, const double delta_h,
-                            const double delta_v) const
+                            const double delta_v, const bool finger,
+                            const bool stop, const uint32_t time)
 {
-    if (on_scroll) {
+    scroll_finger = finger;
+    scroll_time = time;
+    if ((delta_h || delta_v) && on_scroll) {
         on_scroll(kmods, delta_h, delta_v);
+    }
+    if (stop) {
+        handle_scroll_stop();
     }
 }
 
@@ -180,13 +186,14 @@ void AppMode::switch_current()
     Application::redraw();
 }
 
-void AppMode::draw_empty(Pixmap& wnd, const argb_t bkg)
+void AppMode::draw_empty(Canvas& wnd, const argb_t bkg)
 {
     // fill window
-    wnd.fill({ 0, 0, wnd.width(), wnd.height() }, bkg);
-    const ssize_t x = static_cast<ssize_t>(wnd.width() / 2) -
+    const Size wsz = wnd.size();
+    wnd.fill({ 0, 0, wsz.width, wsz.height }, bkg);
+    const ssize_t x = static_cast<ssize_t>(wsz.width / 2) -
         static_cast<ssize_t>(Resource::empty.width() / 2);
-    const ssize_t y = static_cast<ssize_t>(wnd.height() / 2) -
+    const ssize_t y = static_cast<ssize_t>(wsz.height / 2) -
         static_cast<ssize_t>(Resource::empty.height() / 2);
 
     // draw placeholder

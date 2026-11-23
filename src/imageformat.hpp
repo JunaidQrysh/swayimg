@@ -186,6 +186,7 @@ protected:
             std::memcmp(data.data + offset, signature, S) == 0;
     }
 
+public:
     /**
      * Create thumbnail from full-size image.
      * @param pm origin image pixmap

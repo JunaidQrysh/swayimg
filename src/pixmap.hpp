@@ -80,6 +80,20 @@ public:
     operator bool() const { return pm_width && pm_height; }
 
     /**
+     * Get unique pixmap identifier, it changes every time the pixmap is
+     * (re)created or modified by one of the pixmap methods. Used as a key for
+     * caching derived data (e.g. GPU textures).
+     * @return pixmap identifier
+     */
+    [[nodiscard]] uint64_t id() const { return pm_id; }
+
+    /**
+     * Mark pixmap as modified (generate new identifier). Must be called after
+     * pixel data was changed directly via pointer.
+     */
+    void touch();
+
+    /**
      * Cast to Size object.
      * @return Size object
      */
@@ -221,6 +235,7 @@ public:
      */
     template <typename Fn> void foreach(Fn&& fn)
     {
+        touch();
         assert(pm_ext || !pm_data.empty());
         assert(format() == Format::RGB || format() == Format::ARGB);
 
@@ -250,4 +265,5 @@ private:
     size_t pm_stride = 0;         ///< Row size in bytes
     std::vector<uint8_t> pm_data; ///< Pixel data (owned)
     uint8_t* pm_ext = nullptr;    ///< Pixel data (attached)
+    uint64_t pm_id = 0;           ///< Unique identifier
 };

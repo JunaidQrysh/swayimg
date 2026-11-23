@@ -3,6 +3,7 @@
 // Copyright (C) 2020 Artem Senichev <artemsen@gmail.com>
 
 #include "../imageformat.hpp"
+#include "../swcanvas.hpp"
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpragmas"
@@ -50,7 +51,8 @@ public:
         Pixmap& pm = image->frames[0].pm;
         pm.create(Pixmap::ARGB, canvas.width, canvas.height);
 
-        image->draw(0, pm, 1.0, 0, 0);
+        SwCanvas sw(pm);
+        image->draw(0, sw, 1.0, 0, 0);
 
         image->format = get_format(svg);
 
@@ -249,8 +251,17 @@ private:
             svg_rotation %= 360;
         }
 
-        void draw(const size_t, Pixmap& target, const double scale,
+        void draw(const size_t, Canvas& canvas, const double scale,
                   const ssize_t x, const ssize_t y) override
+        {
+            canvas.raster([&](Pixmap& target) {
+                render_svg(target, scale, x, y);
+            });
+        }
+
+    private:
+        void render_svg(Pixmap& target, const double scale, const ssize_t x,
+                        const ssize_t y)
         {
             const Pixmap& pm = frames[0].pm;
             const RsvgRectangle viewbox = {
@@ -308,7 +319,6 @@ private:
             rsvg_handle_render_document(svg, cairo.get(), &viewbox, nullptr);
         }
 
-    private:
         RsvgHandle* svg;           ///< RSVG handle containing the image data
         double svg_offset_x = 0.0; ///< Horizontal offset relative to canvas
         double svg_offset_y = 0.0; ///< Vertical offset relative to canvas

@@ -174,6 +174,7 @@ or in the file `/usr/share/swayimg/example.lua` after installing the program.
   * [swayimg.gallery.selected_color](#swayimggalleryselected_color): Background color for currently selected thumbnail
   * [swayimg.gallery.border_color](#swayimggalleryborder_color): Border color for currently selected thumbnail
   * [swayimg.gallery.hover](#swayimggalleryhover): Change current thumbnail on mouse hover
+  * [swayimg.gallery.scroll_speed](#swayimggalleryscroll_speed): Touchpad scroll speed
   * [swayimg.gallery.pstore](#swayimggallerypstore): Use persistent storage for thumbnails
   * [swayimg.gallery.pstore_path](#swayimggallerypstore_path): Path for thumbnails persistent storage
   * [swayimg.gallery.preload](#swayimggallerypreload): Preload invisible thumbnails
@@ -2174,6 +2175,17 @@ swayimg.gallery.hover: boolean
 Change current thumbnail on mouse hover.
 
 Since 5.5.
+
+Write-only field.
+
+### swayimg.gallery.scroll_speed
+
+```lua
+swayimg.gallery.scroll_speed: number
+```
+
+Touchpad scroll speed: how far the thumbnails move relative to the finger
+movement (1.0 = follow the finger exactly). Default is 1.5.
 
 Write-only field.
 

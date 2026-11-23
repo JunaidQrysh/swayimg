@@ -28,13 +28,9 @@ swayimg.format_conf = {
     color = 0xffffffff,      -- font color
     background = 0x00000000  -- background color
   },
-  video = {             -- storyboard from video files
-    enable = true,      -- enable video storyboard
-    size = 300,         -- size (width) of a single tile (frame)
-    columns = 3,        -- number of columns in storyboard
-    rows = 3,           -- number of rows in storyboard
-    padding = 5,        -- gap between frames in pixels
-    label = 0x0affffff  -- label color in gallery mode
+  video = {             -- video files (played in mpv)
+    enable = true,      -- enable video decoder
+    size = 1920         -- max size of the still frame shown in viewer
   },
 }
 
@@ -259,6 +255,7 @@ swayimg.gallery.unselected_color = 0xff202020 -- background color for unselected
 swayimg.gallery.window_color = 0xff000000     -- window background color
 swayimg.gallery.pinch_factor = 100.0          -- pinch gesture factor
 swayimg.gallery.hover = true                  -- enable mouse following
+swayimg.gallery.scroll_speed = 1.5            -- touchpad scroll speed
 swayimg.gallery.cache = 100                   -- number of thumbnails stored in memory
 swayimg.gallery.preload = false               -- preloading invisible thumbnails
 swayimg.gallery.embedded_thumb = true         -- use embedded thumbnails

@@ -41,12 +41,17 @@ struct Scroll {
     keymod_t kmods; ///< Keyboard modifiers
     double delta_h; ///< Horizontal scrolling delta
     double delta_v; ///< Vertival scrolling delta
+    bool finger;    ///< Scroll source is a finger on touchpad
+    bool stop;      ///< Scrolling stopped (finger lifted)
+    uint32_t time;  ///< Event timestamp in milliseconds
 };
 
 /** Mouse clock event. */
 struct MouseClick {
-    InputMouse mouse; ///< Mouse key state
-    Point pointer;    ///< Mouse pointer coordinates within the window
+    InputMouse mouse;                ///< Mouse key state
+    Point pointer;                   ///< Mouse pointer coordinates
+    InputMouse::mouse_btn_t button;  ///< Changed button
+    bool pressed;                    ///< Button pressed (false: released)
 };
 
 /** Mouse move event. */
@@ -59,6 +64,8 @@ struct MouseMove {
 /** Gesture: pinch event. */
 struct GesturePinch {
     double scale_delta; ///< Scale diff
+    double dx, dy;      ///< Movement of the gesture center (pixels)
+    bool end;           ///< Gesture finished
 };
 
 /** Signal occur event. */

@@ -6,6 +6,11 @@
 
 #include "appmode.hpp"
 #include "fdevent.hpp"
+#include "fling.hpp"
+
+#include <memory>
+
+class EmbeddedVideo;
 #include "imagelist.hpp"
 
 #include <atomic>
@@ -62,6 +67,7 @@ public:
 
     /** Constructor. */
     Viewer();
+    ~Viewer();
 
     /**
      * Open next image file.
@@ -234,14 +240,100 @@ public:
     ImageEntryPtr get_current() override;
     bool set_current(const ImageEntryPtr& entry) override;
     void window_resize(const Size& wnd) override;
-    void window_redraw(Pixmap& wnd) override;
+    void window_redraw(Canvas& wnd) override;
     void handle_mmove(const InputMouse& input, const Point& pos,
                       const Point& delta) override;
-    void handle_pinch(const double scale_delta) override;
+    void handle_pinch(const double scale_delta, const double dx,
+                      const double dy) override;
+    void handle_pinch_end() override;
+    bool handle_mbutton(const InputMouse::mouse_btn_t button, const bool pressed,
+                        const Point& pos) override;
     void handle_imagelist(const ImageListEvent event,
                           const std::vector<ImageEntryPtr>& entries) override;
+    bool animate(const double dt) override;
+
+    /**
+     * Pan image by scrolling (mouse wheel or touchpad).
+     * @param delta_h,delta_v scroll delta
+     */
+    void pan(const double delta_h, const double delta_v);
+
+    /**
+     * Start opening transition: image grows from the thumbnail.
+     * @param tile thumbnail tile on the window
+     * @param cover true if thumbnail covers the tile (cropped), false if fit
+     */
+    void transition_from(const Rectangle& tile, const bool cover);
+
+    /**
+     * Start closing transition: image shrinks to the thumbnail.
+     * @param tile thumbnail tile on the window
+     * @param cover true if thumbnail covers the tile (cropped), false if fit
+     */
+    void transition_to(const Rectangle& tile, const bool cover);
+
+    /**
+     * Draw only the image (without window background), used on top of the
+     * fading layer during mode transitions.
+     * @param wnd canvas to draw on
+     */
+    void draw_photo(Canvas& wnd);
+
+    /** Toggle pause of the playing video. */
+    void video_pause();
+
+    /**
+     * Seek the playing video.
+     * @param seconds relative seek distance
+     */
+    void video_seek(const double seconds);
+
+    /**
+     * Change volume of the playing video.
+     * @param delta volume change in percent
+     */
+    void video_volume(const double delta);
+
+protected:
+    void handle_scroll_stop() override;
 
 private:
+    /**
+     * Show the image at its current scale/position without animation.
+     */
+    void snap_view() { view_snap = true; }
+
+    /**
+     * Stop kinetic panning.
+     */
+    void stop_pan();
+
+    /**
+     * Start embedded video playback (or external player as fallback).
+     * @param entry video file entry
+     */
+    void start_video(const ImageEntryPtr& entry);
+
+    /** Stop embedded video playback. */
+    void stop_video();
+
+    /**
+     * Convert window coordinates to position on the playing video.
+     * @param pos window coordinates
+     * @param rel_x,rel_y output relative position in range [0,1]
+     * @return false if no video is playing or position is out of the video
+     */
+    bool video_point(const Point& pos, double& rel_x, double& rel_y) const;
+
+public:
+    /** Stop playback and free the player (before GL context is destroyed). */
+    void release_video();
+
+    /** Initialize video player in advance (GL context must be current). */
+    void prewarm_video();
+
+private:
+
     /**
      * Set current image.
      * @param img image instance to set as current
@@ -271,10 +363,11 @@ private:
      * @param pos origin position
      * @param sz image size
      * @param max_pos max position
+     * @param center true to center the image if it fits
      * @retrun fixed position
      */
     static ssize_t fixup_position(const ssize_t pos, const size_t sz,
-                                  const size_t max_pos);
+                                  const size_t max_pos, const bool center);
 
     /**
      * Start preloader.
@@ -350,6 +443,45 @@ protected:
     double focus_factor; ///< Dimming factor outside focus
 
     InputMouse drag; ///< Mouse state for dragging an image across the canvas
+
+    // Displayed (animated) transform: follows scale/position smoothly
+    double view_scale = 0; ///< Displayed scale (0 = not initialized)
+    double view_x = 0;     ///< Displayed horizontal position
+    double view_y = 0;     ///< Displayed vertical position
+    bool view_snap = true; ///< Next frame shows target without animation
+    /** Transition between two transforms. */
+    struct ViewAnim {
+        double s0 = 0, x0 = 0, y0 = 0; ///< Start transform
+        double s1 = 0, x1 = 0, y1 = 0; ///< Target transform
+        double t = 1.0;                ///< Progress
+        double duration = 0.2;         ///< Duration in seconds
+    } view_anim;
+    bool view_locked = false; ///< Don't follow target (closing transition)
+    bool clip_anim = false;   ///< Animate image clipping (mode transition)
+    Rectangle clip_from;      ///< Clipping area at start of transition
+    Rectangle clip_to;        ///< Clipping area at end of transition
+
+    /**
+     * Get current clipping area of animated image.
+     * @return clipping rectangle (whole window if no clipping)
+     */
+    [[nodiscard]] Rectangle view_clip() const;
+
+    // Embedded video playback
+    std::unique_ptr<EmbeddedVideo> video; ///< Video player
+    ImageEntryPtr video_entry;            ///< Entry of the playing video
+    ImageEntryPtr video_pending; ///< Video to start after transition
+
+    bool pinching = false; ///< Pinch gesture in progress (no position limits)
+    double pinch_rx = 0;   ///< Fractional pinch movement remainder (x)
+    double pinch_ry = 0;   ///< Fractional pinch movement remainder (y)
+
+    // Kinetic panning
+    FlingTracker pan_tracker; ///< Touchpad fling velocity estimation
+    double pan_vx = 0;        ///< Horizontal velocity (px/sec)
+    double pan_vy = 0;        ///< Vertical velocity (px/sec)
+    double pan_rx = 0;        ///< Fractional horizontal remainder
+    double pan_ry = 0;        ///< Fractional vertical remainder
 
     /** Image pool. */
     struct ImagePool {

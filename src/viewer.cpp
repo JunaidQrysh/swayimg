@@ -11,10 +11,40 @@
 #include "render.hpp"
 #include "resources.hpp"
 #include "text.hpp"
+#include "embeddedvideo.hpp"
+#include "fdothumb.hpp"
+#include "videoplayer.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <format>
 #include <utility>
+
+namespace {
+
+// Duration of zoom/pan transition in seconds
+constexpr double VIEW_ANIM_TIME = 0.2;
+// Duration of gallery<->viewer transition in seconds
+constexpr double MODE_ANIM_TIME = 0.28;
+
+// Touchpad panning speed (relative to finger movement) and wheel step
+constexpr double FINGER_PAN_FACTOR = 16.0 * 1.5;
+constexpr double WHEEL_PAN_STEP = 50.0;
+
+// Kinetic panning
+constexpr double PAN_FRICTION = 4.0;
+constexpr double PAN_MIN_VELOCITY = 300.0;
+constexpr double PAN_MAX_VELOCITY = 8000.0;
+constexpr double PAN_STOP_VELOCITY = 15.0;
+
+/** Ease out cubic. */
+double ease_out(const double t)
+{
+    const double inv = 1.0 - std::clamp(t, 0.0, 1.0);
+    return 1.0 - inv * inv * inv;
+}
+
+} // namespace
 
 /** Max scale factor. */
 constexpr double MAX_SCALE = 100.0;
@@ -58,6 +88,8 @@ Viewer::Viewer()
 
     Defaults::viewer::bind_inputs(this);
 }
+
+Viewer::~Viewer() = default;
 
 bool Viewer::open(const ImageList::Dir dir)
 {
@@ -308,6 +340,7 @@ void Viewer::rotate(const size_t angle)
 
     if (image) {
         image->rotate(angle);
+        snap_view();
 
         const Pixmap& pm = image->frames[frame_index].pm;
         const ssize_t diff = static_cast<ssize_t>(pm.width()) -
@@ -435,6 +468,9 @@ void Viewer::activate(const ImageEntryPtr& entry, const Size& wnd)
 
     if (entry && image && image->entry == entry && !entry->removed) {
         set_image(image); // reinit state without reloading image
+        if (this == &Viewer::self() && VideoPlayer::is_video(entry)) {
+            start_video(entry);
+        }
     } else if (!entry ||
                (!set_current(entry) && !open(ImageList::Dir::First))) {
         set_image(nullptr);
@@ -444,6 +480,7 @@ void Viewer::activate(const ImageEntryPtr& entry, const Size& wnd)
 void Viewer::deactivate()
 {
     preloader_stop();
+    stop_video();
 
     // restore cursor and content type
     Ui* ui = Application::get_ui();
@@ -483,11 +520,31 @@ bool Viewer::set_current(const ImageEntryPtr& entry)
         }
     }
 
+    if (!new_image && this == &Viewer::self() &&
+        VideoPlayer::is_video(entry) && EmbeddedVideo::available()) {
+        // video placeholder from thumbnail cache: much faster than decoding
+        // a frame, and the video replaces it as soon as playback starts
+        Pixmap thumb = FdoThumb::load(entry->path);
+        if (thumb) {
+            new_image = std::make_shared<Image>();
+            new_image->frames.resize(1);
+            new_image->frames[0].pm = std::move(thumb);
+            new_image->format = "Video";
+            new_image->entry = entry;
+        }
+    }
+
     if (!new_image) {
         new_image = FormatFactory::self().load(entry);
     }
     if (new_image) {
+        // play videos (not in slideshow mode)
+        const bool changed = !image || image->entry != entry;
         set_image(new_image);
+        if (changed && this == &Viewer::self() &&
+            VideoPlayer::is_video(entry)) {
+            start_video(entry);
+        }
     }
 
     return !!new_image;
@@ -496,6 +553,7 @@ bool Viewer::set_current(const ImageEntryPtr& entry)
 void Viewer::window_resize(const Size& wnd)
 {
     window_size = wnd;
+    snap_view();
     if (image) {
         if (std::holds_alternative<Scale>(default_scale) &&
             std::get<Scale>(default_scale) == Scale::Keep) {
@@ -506,7 +564,7 @@ void Viewer::window_resize(const Size& wnd)
     }
 }
 
-void Viewer::window_redraw(Pixmap& wnd)
+void Viewer::window_redraw(Canvas& wnd)
 {
     if (!image) {
         const argb_t* bkg = std::get_if<argb_t>(&window_bkg);
@@ -515,7 +573,12 @@ void Viewer::window_redraw(Pixmap& wnd)
     }
 
     const Pixmap& pm = image->frames[frame_index].pm;
-    const Rectangle imgr = { position, static_cast<Size>(pm) * scale };
+    const double vscale = view_scale > 0 ? view_scale : scale;
+    const Point vpos = view_scale > 0
+        ? Point { .x = static_cast<ssize_t>(std::lround(view_x)),
+                  .y = static_cast<ssize_t>(std::lround(view_y)) }
+        : position;
+    const Rectangle imgr = { vpos, static_cast<Size>(pm) * vscale };
 
     // clear image background
     if (pm.format() == Pixmap::ARGB) {
@@ -527,25 +590,35 @@ void Viewer::window_redraw(Pixmap& wnd)
     }
 
     // put image on window surface
-    image->draw(frame_index, wnd, scale, position.x, position.y);
+    image->draw(frame_index, wnd, vscale, vpos.x, vpos.y);
+
+    // video frame on top of the still preview frame
+    const bool playing = video && video_entry && image->entry == video_entry;
+    if (playing && !clip_anim) {
+        wnd.draw_texture(
+            [this](const Size& size) {
+                return video->render(size);
+            },
+            static_cast<Size>(pm), scale, vpos, vscale,
+            { 0, 0, window_size.width, window_size.height });
+    }
 
     // fill window background
     if (std::holds_alternative<argb_t>(window_bkg)) {
-        Render::self().fill_inverse(wnd, imgr, std::get<argb_t>(window_bkg));
+        wnd.fill_inverse(imgr, std::get<argb_t>(window_bkg));
     } else {
         switch (std::get<Background>(window_bkg)) {
             case Background::Mirror:
-                Render::self().mirror_background(wnd, imgr);
+                wnd.background(Canvas::Background::Mirror, imgr);
                 break;
             case Background::Extend:
-                Render::self().extend_background(wnd, imgr);
+                wnd.background(Canvas::Background::Extend, imgr);
                 break;
             case Background::Auto:
-                if (imgr.width > imgr.height) {
-                    Render::self().mirror_background(wnd, imgr);
-                } else {
-                    Render::self().extend_background(wnd, imgr);
-                }
+                wnd.background(imgr.width > imgr.height
+                                   ? Canvas::Background::Mirror
+                                   : Canvas::Background::Extend,
+                               imgr);
                 break;
         }
     }
@@ -553,9 +626,9 @@ void Viewer::window_redraw(Pixmap& wnd)
     // mark icon
     if (image->entry->mark) {
         const ssize_t margin = 10;
-        const ssize_t x = static_cast<ssize_t>(wnd.width()) -
+        const ssize_t x = static_cast<ssize_t>(wnd.size().width) -
             static_cast<ssize_t>(Resource::mark.width()) - margin;
-        const ssize_t y = static_cast<ssize_t>(wnd.height()) -
+        const ssize_t y = static_cast<ssize_t>(wnd.size().height) -
             static_cast<ssize_t>(Resource::mark.height()) - margin;
         wnd.mask(Resource::mark, { .x = x, .y = y }, mark_color);
     }
@@ -564,8 +637,7 @@ void Viewer::window_redraw(Pixmap& wnd)
     if (focus_radius) {
         const Point pointer = Application::get_ui()->get_mouse();
         if (pointer) {
-            Render::self().dim_outside(wnd, pointer, focus_radius,
-                                       focus_factor);
+            wnd.dim_outside(pointer, focus_radius, focus_factor);
         }
     }
 }
@@ -595,9 +667,20 @@ void Viewer::handle_mmove(const InputMouse& input, const Point& pos,
         }
     } else if (drag && drag == input) {
         new_pos += delta;
+        stop_pan();
     }
 
+    if (new_pos != position) {
+        snap_view();
+    }
     set_position(new_pos);
+
+    // show video player's on-screen controller
+    double rx;
+    double ry;
+    if (video_point(pos, rx, ry)) {
+        video->mouse_move(rx, ry);
+    }
 
     if (focus_radius) {
         // force redraw even if image position was not changed
@@ -605,9 +688,455 @@ void Viewer::handle_mmove(const InputMouse& input, const Point& pos,
     }
 }
 
-void Viewer::handle_pinch(const double scale_delta)
+void Viewer::handle_pinch(const double scale_delta, const double dx,
+                          const double dy)
 {
-    set_scale(scale + scale_delta * scale * pinch_factor);
+    if (!image) {
+        return;
+    }
+
+    // the image follows fingers without limits until the gesture ends
+    if (!pinching) {
+        pinching = true;
+        pinch_rx = 0;
+        pinch_ry = 0;
+    }
+    stop_pan();
+    snap_view();
+
+    // two-finger movement during the pinch pans the image
+    pinch_rx += dx;
+    pinch_ry += dy;
+    const ssize_t mx = static_cast<ssize_t>(pinch_rx);
+    const ssize_t my = static_cast<ssize_t>(pinch_ry);
+    pinch_rx -= mx;
+    pinch_ry -= my;
+    position.x += mx;
+    position.y += my;
+
+    set_scale(scale + scale_delta * scale * pinch_factor,
+              Application::get_ui()->get_mouse());
+}
+
+void Viewer::handle_pinch_end()
+{
+    if (!pinching) {
+        return;
+    }
+    pinching = false;
+    if (image) {
+        // settle into valid position with animation
+        view_snap = false;
+        fixup_position();
+    }
+}
+
+bool Viewer::video_point(const Point& pos, double& rel_x, double& rel_y) const
+{
+    if (!video || !video_entry || !image || image->entry != video_entry ||
+        clip_anim || !pos) {
+        return false;
+    }
+    const Pixmap& pm = image->frames[frame_index].pm;
+    const double vscale = view_scale > 0 ? view_scale : scale;
+    const double vx = view_scale > 0 ? view_x : position.x;
+    const double vy = view_scale > 0 ? view_y : position.y;
+    const double w = pm.width() * vscale;
+    const double h = pm.height() * vscale;
+    if (w <= 0 || h <= 0) {
+        return false;
+    }
+    rel_x = (pos.x - vx) / w;
+    rel_y = (pos.y - vy) / h;
+    return rel_x >= 0 && rel_x <= 1 && rel_y >= 0 && rel_y <= 1;
+}
+
+bool Viewer::handle_mbutton(const InputMouse::mouse_btn_t button,
+                            const bool pressed, const Point& pos)
+{
+    double rx;
+    double ry;
+    if (!video_point(pos, rx, ry)) {
+        return false;
+    }
+
+    const char* name = nullptr;
+    switch (button) {
+        case InputMouse::BUTTON_LEFT:
+            name = "MBTN_LEFT";
+            break;
+        case InputMouse::BUTTON_RIGHT:
+            name = "MBTN_RIGHT";
+            break;
+        case InputMouse::BUTTON_MIDDLE:
+            name = "MBTN_MID";
+            break;
+        default:
+            return false;
+    }
+
+    // mouse input goes to video player's on-screen controller
+    video->mouse_move(rx, ry);
+    video->mouse_button(name, pressed);
+    return true;
+}
+
+bool Viewer::animate(const double dt)
+{
+    if (!image) {
+        return false;
+    }
+
+    bool in_progress = false;
+
+    // kinetic panning moves the target position directly
+    if (pan_vx != 0 || pan_vy != 0) {
+        pan_rx += pan_vx * dt;
+        pan_ry += pan_vy * dt;
+        const ssize_t dx = static_cast<ssize_t>(pan_rx);
+        const ssize_t dy = static_cast<ssize_t>(pan_ry);
+        pan_rx -= dx;
+        pan_ry -= dy;
+        const Point prev = position;
+        set_position(Point { .x = position.x + dx, .y = position.y + dy });
+        // stop at the edges
+        if (dx && position.x == prev.x) {
+            pan_vx = 0;
+        }
+        if (dy && position.y == prev.y) {
+            pan_vy = 0;
+        }
+        const double decay = std::exp(-dt * PAN_FRICTION);
+        pan_vx *= decay;
+        pan_vy *= decay;
+        if (std::hypot(pan_vx, pan_vy) < PAN_STOP_VELOCITY) {
+            stop_pan();
+        }
+        view_snap = true;
+        in_progress = pan_vx != 0 || pan_vy != 0;
+    }
+
+    // displayed transform follows the target one
+    const double ts = scale;
+    const double tx = static_cast<double>(position.x);
+    const double ty = static_cast<double>(position.y);
+
+    if (view_snap || view_scale <= 0) {
+        view_snap = false;
+        view_scale = ts;
+        view_x = tx;
+        view_y = ty;
+        view_anim = { ts, tx, ty, ts, tx, ty, 1.0, VIEW_ANIM_TIME };
+        clip_anim = false;
+    } else if (!view_locked &&
+               (ts != view_anim.s1 || tx != view_anim.x1 ||
+                ty != view_anim.y1)) {
+        // target changed: start new transition from the displayed state
+        view_anim = { view_scale, view_x, view_y, ts,
+                      tx,         ty,     0.0,    VIEW_ANIM_TIME };
+        clip_anim = false;
+    }
+
+    if (view_anim.t < 1.0) {
+        ViewAnim& va = view_anim;
+        va.t = std::min(1.0, va.t + dt / va.duration);
+        const double e = ease_out(va.t);
+
+        // geometric interpolation of scale
+        view_scale = va.s0 * std::pow(va.s1 / va.s0, e);
+
+        // zoom around the fixed point of start and target transforms, so the
+        // anchored point (e.g. under mouse pointer) doesn't drift
+        const bool zoom = std::abs(va.s1 - va.s0) > va.s0 * 1e-6;
+        const auto axis = [&](const double p0, const double p1) {
+            if (!zoom) {
+                return p0 + (p1 - p0) * e;
+            }
+            const double fixed = (p0 - p1) / (va.s1 - va.s0); // image coord
+            return p0 + va.s0 * fixed - view_scale * fixed;
+        };
+        view_x = axis(va.x0, va.x1);
+        view_y = axis(va.y0, va.y1);
+
+        if (va.t >= 1.0) {
+            view_scale = va.s1;
+            view_x = va.x1;
+            view_y = va.y1;
+            if (!view_locked) {
+                clip_anim = false;
+            }
+        } else {
+            in_progress = true;
+        }
+    }
+
+    // start video playback when opening transition is finished
+    if (video_pending && !clip_anim && is_active()) {
+        const ImageEntryPtr entry = video_pending;
+        video_pending = nullptr;
+        if (image->entry == entry) {
+            if (!video) {
+                video = std::make_unique<EmbeddedVideo>();
+            }
+            if (video->start(entry->path)) {
+                video_entry = entry;
+                in_progress = true;
+            } else {
+                release_video();
+                VideoPlayer::open(entry->path);
+            }
+        }
+    }
+
+    return in_progress;
+}
+
+void Viewer::pan(const double delta_h, const double delta_v)
+{
+    if (!image) {
+        return;
+    }
+
+    if (scroll_finger) {
+        // touchpad: follow the finger
+        if (pan_tracker.empty()) {
+            stop_pan(); // touch stops kinetic scrolling
+        }
+        // inverted direction: content follows the fingers
+        const double factor =
+            -FINGER_PAN_FACTOR * Application::get_ui()->get_scale();
+        const double dx = delta_h * factor;
+        const double dy = delta_v * factor;
+        pan_tracker.add(scroll_time, dx, dy);
+        pan_rx += dx;
+        pan_ry += dy;
+        const ssize_t ix = static_cast<ssize_t>(pan_rx);
+        const ssize_t iy = static_cast<ssize_t>(pan_ry);
+        pan_rx -= ix;
+        pan_ry -= iy;
+        snap_view();
+        set_position(Point { .x = position.x + ix, .y = position.y + iy });
+    } else {
+        // mouse wheel: animated step
+        stop_pan();
+        set_position(Point {
+            .x = position.x + static_cast<ssize_t>(delta_h * WHEEL_PAN_STEP),
+            .y = position.y + static_cast<ssize_t>(delta_v * WHEEL_PAN_STEP),
+        });
+    }
+    Application::redraw();
+}
+
+void Viewer::transition_from(const Rectangle& tile, const bool cover)
+{
+    if (!image || !tile) {
+        return;
+    }
+
+    const Pixmap& pm = image->frames[frame_index].pm;
+    const double sw = static_cast<double>(tile.width) / pm.width();
+    const double sh = static_cast<double>(tile.height) / pm.height();
+    const double s = cover ? std::max(sw, sh) : std::min(sw, sh);
+    const double w = pm.width() * s;
+    const double h = pm.height() * s;
+    const double x = tile.x + (tile.width - w) / 2.0;
+    const double y = tile.y + (tile.height - h) / 2.0;
+
+    // start from the thumbnail, finish at the current scale/position
+    view_snap = false;
+    view_locked = false;
+    view_scale = s;
+    view_x = x;
+    view_y = y;
+    view_anim = { s,
+                  x,
+                  y,
+                  scale,
+                  static_cast<double>(position.x),
+                  static_cast<double>(position.y),
+                  0.0,
+                  MODE_ANIM_TIME };
+
+    const Rectangle full { 0, 0, window_size.width, window_size.height };
+    clip_from = cover ? tile
+                      : Rectangle(static_cast<ssize_t>(x),
+                                  static_cast<ssize_t>(y),
+                                  static_cast<size_t>(w),
+                                  static_cast<size_t>(h));
+    clip_to = full.intersect({ position, static_cast<Size>(pm) * scale });
+    clip_anim = true;
+}
+
+void Viewer::transition_to(const Rectangle& tile, const bool cover)
+{
+    if (!image || !tile) {
+        return;
+    }
+
+    const Pixmap& pm = image->frames[frame_index].pm;
+    const double sw = static_cast<double>(tile.width) / pm.width();
+    const double sh = static_cast<double>(tile.height) / pm.height();
+    const double s = cover ? std::max(sw, sh) : std::min(sw, sh);
+    const double w = pm.width() * s;
+    const double h = pm.height() * s;
+    const double x = tile.x + (tile.width - w) / 2.0;
+    const double y = tile.y + (tile.height - h) / 2.0;
+
+    if (view_scale <= 0) {
+        view_scale = scale;
+        view_x = position.x;
+        view_y = position.y;
+    }
+
+    // shrink from the currently displayed state to the thumbnail
+    const Rectangle full { 0, 0, window_size.width, window_size.height };
+    clip_from = full.intersect(
+        { Point { .x = static_cast<ssize_t>(view_x),
+                  .y = static_cast<ssize_t>(view_y) },
+          static_cast<Size>(pm) * view_scale });
+    clip_to = cover ? tile
+                    : Rectangle(static_cast<ssize_t>(x),
+                                static_cast<ssize_t>(y), static_cast<size_t>(w),
+                                static_cast<size_t>(h));
+    clip_anim = true;
+
+    stop_pan();
+    view_snap = false;
+    view_locked = true;
+    view_anim = { view_scale, view_x, view_y, s, x, y, 0.0, MODE_ANIM_TIME };
+}
+
+Rectangle Viewer::view_clip() const
+{
+    const Rectangle full { 0, 0, window_size.width, window_size.height };
+    if (!clip_anim) {
+        return full;
+    }
+    const double e = ease_out(view_anim.t);
+    const auto lerp = [e](const double a, const double b) {
+        return a + (b - a) * e;
+    };
+    return {
+        static_cast<ssize_t>(std::lround(lerp(clip_from.x, clip_to.x))),
+        static_cast<ssize_t>(std::lround(lerp(clip_from.y, clip_to.y))),
+        static_cast<size_t>(std::lround(
+            lerp(static_cast<double>(clip_from.width), clip_to.width))),
+        static_cast<size_t>(std::lround(
+            lerp(static_cast<double>(clip_from.height), clip_to.height))),
+    };
+}
+
+void Viewer::draw_photo(Canvas& wnd)
+{
+    if (!image) {
+        return;
+    }
+
+    const Pixmap& pm = image->frames[frame_index].pm;
+    const double vscale = view_scale > 0 ? view_scale : scale;
+    const Point vpos = view_scale > 0
+        ? Point { .x = static_cast<ssize_t>(std::lround(view_x)),
+                  .y = static_cast<ssize_t>(std::lround(view_y)) }
+        : position;
+    const Rectangle clip = view_clip();
+    const Rectangle imgr =
+        clip.intersect({ vpos, static_cast<Size>(pm) * vscale });
+    if (!imgr) {
+        return;
+    }
+
+    if (pm.format() == Pixmap::ARGB) {
+        if (tr_chessboard) {
+            wnd.grid(imgr, tr_cbsize, tr_cbcolor[0], tr_cbcolor[1]);
+        } else {
+            wnd.fill(imgr, tr_bgcolor);
+        }
+    }
+    wnd.draw(pm, vpos, vscale, clip);
+}
+
+void Viewer::start_video(const ImageEntryPtr& entry)
+{
+    stop_video();
+    if (EmbeddedVideo::available()) {
+        if (video && video->ready() && video->start(entry->path)) {
+            // renderer is ready: start loading now, frames are shown after
+            // the opening transition
+            video_entry = entry;
+        } else {
+            // first video: initialize player after the opening transition
+            video_pending = entry;
+        }
+        Application::redraw();
+    } else {
+        VideoPlayer::open(entry->path); // fall back to external player
+    }
+}
+
+void Viewer::stop_video()
+{
+    video_pending = nullptr;
+    video_entry = nullptr;
+    if (video) {
+        video->stop();
+    }
+}
+
+void Viewer::prewarm_video()
+{
+    if (!video && EmbeddedVideo::available()) {
+        video = std::make_unique<EmbeddedVideo>();
+        if (!video->prepare()) {
+            video.reset();
+        }
+    }
+}
+
+void Viewer::release_video()
+{
+    stop_video();
+    video.reset();
+}
+
+void Viewer::video_pause()
+{
+    if (video) {
+        video->toggle_pause();
+    }
+}
+
+void Viewer::video_seek(const double seconds)
+{
+    if (video) {
+        video->seek(seconds);
+    }
+}
+
+void Viewer::video_volume(const double delta)
+{
+    if (video) {
+        video->change_volume(delta);
+    }
+}
+
+void Viewer::handle_scroll_stop()
+{
+    const auto [vx, vy] = pan_tracker.release(scroll_time);
+    const double speed = std::hypot(vx, vy);
+    if (speed >= PAN_MIN_VELOCITY) {
+        const double k = std::min(1.0, PAN_MAX_VELOCITY / speed);
+        pan_vx = vx * k;
+        pan_vy = vy * k;
+        Application::redraw();
+    }
+}
+
+void Viewer::stop_pan()
+{
+    pan_vx = 0;
+    pan_vy = 0;
+    pan_rx = 0;
+    pan_ry = 0;
 }
 
 void Viewer::handle_imagelist(const ImageListEvent event,
@@ -658,8 +1187,20 @@ void Viewer::set_image(const ImagePtr& img)
         image_pool.history.put(image);
     }
 
+    if ((video_entry || video_pending) &&
+        (!img ||
+         (img->entry != video_entry && img->entry != video_pending))) {
+        stop_video(); // another image: stop playback
+    }
+
     image = img;
     frame_index = 0;
+
+    // new image is shown immediately at its place
+    stop_pan();
+    snap_view();
+    view_locked = false;
+    clip_anim = false;
 
     if (!image) {
         animation_timer.reset(0, 0); // no frames left to animate
@@ -750,13 +1291,18 @@ void Viewer::update_text(const TextUpdate what) const
 }
 
 ssize_t Viewer::fixup_position(const ssize_t pos, const size_t sz,
-                               const size_t max_pos)
+                               const size_t max_pos, const bool center)
 {
     ssize_t fixed = pos;
 
     if (sz <= max_pos) {
-        // entire size fits, center it
-        fixed = max_pos / 2 - sz / 2;
+        if (center) {
+            // entire image fits the window, center it
+            fixed = max_pos / 2 - sz / 2;
+        } else {
+            // keep it where it is (e.g. zoom anchor), but inside the window
+            fixed = std::clamp<ssize_t>(pos, 0, max_pos - sz);
+        }
     } else {
         // prevent going outside the max position
         const ssize_t out_pos = fixed + sz;
@@ -778,7 +1324,7 @@ void Viewer::fixup_position()
     const Pixmap& pm = image->frames[frame_index].pm;
     const Size scaled = static_cast<Size>(pm) * scale;
 
-    if (auto_pos == AutoPos::Free) {
+    if (auto_pos == AutoPos::Free || pinching) {
         // don't let image to be far out of window
         if (position.x + static_cast<ssize_t>(scaled.width) < 0) {
             position.x = -static_cast<ssize_t>(scaled.width);
@@ -793,10 +1339,14 @@ void Viewer::fixup_position()
             position.y = window_size.height;
         }
     } else {
-        position.x =
-            fixup_position(position.x, scaled.width, window_size.width);
-        position.y =
-            fixup_position(position.y, scaled.height, window_size.height);
+        // center only if the whole image fits the window, otherwise the
+        // smaller side may stay off-center (zooming at the image edge)
+        const bool fits = scaled.width <= window_size.width &&
+            scaled.height <= window_size.height;
+        position.x = fixup_position(position.x, scaled.width,
+                                    window_size.width, fits);
+        position.y = fixup_position(position.y, scaled.height,
+                                    window_size.height, fits);
     }
 
     Application::redraw();

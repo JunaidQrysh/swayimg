@@ -86,6 +86,29 @@ if wlcln.found()
     endforeach
 endif
 
+# GPU rendering support (Wayland only)
+gpu_deps = []
+gpu_found = false
+if wlcln.found() and get_option('gpu').allowed()
+    egl = dependency('egl', required: get_option('gpu'))
+    gles = dependency('glesv2', required: get_option('gpu'))
+    wlegl = dependency('wayland-egl', required: get_option('gpu'))
+    gpu_found = egl.found() and gles.found() and wlegl.found()
+    if gpu_found
+        gpu_deps = [egl, gles, wlegl]
+    endif
+endif
+
+# embedded video playback (requires GPU rendering)
+mpv_found = false
+if gpu_found and get_option('mpv').allowed()
+    libmpv = dependency('mpv', required: get_option('mpv'))
+    if libmpv.found()
+        mpv_found = true
+        gpu_deps += libmpv
+    endif
+endif
+
 # DRM support
 drm = dependency('libdrm', required: get_option('drm'))
 
@@ -168,6 +191,8 @@ inotify = dependency('libinotify', required: false)
 conf = configuration_data()
 conf.set('HAVE_COMPOSITOR', wlcln.found() and get_option('compositor').allowed())
 conf.set('HAVE_WAYLAND', wlcln.found())
+conf.set('HAVE_GPU', gpu_found)
+conf.set('HAVE_LIBMPV', mpv_found)
 conf.set('HAVE_DRM', drm.found())
 conf.set('HAVE_INOTIFY', cc.has_header('sys/inotify.h', dependencies: inotify))
 conf.set('HAVE_LIBEXIV2', exiv.found())
@@ -316,7 +341,9 @@ sources = [
     'src/application.cpp',
     'src/appmode.cpp',
     'src/defaults.cpp',
+    'src/embeddedvideo.cpp',
     'src/fdevent.cpp',
+    'src/fdothumb.cpp',
     'src/font.cpp',
     'src/formatfactory.cpp',
     'src/fsmonitor.cpp',
@@ -333,9 +360,11 @@ sources = [
     'src/render.cpp',
     'src/resources.cpp',
     'src/slideshow.cpp',
+    'src/swcanvas.cpp',
     'src/text.cpp',
     'src/threadpool.cpp',
     'src/urilist.cpp',
+    'src/videoplayer.cpp',
     'src/viewer.cpp',
     'src/xkb.cpp',
     'src/formats/bmp.cpp',
@@ -351,6 +380,9 @@ sources = [
 
 if wlcln.found()
     sources += 'src/ui_wayland.cpp'
+endif
+if gpu_found
+    sources += ['src/glcanvas.cpp', 'src/ui_wayland_gl.cpp']
 endif
 if drm.found()
     sources += 'src/ui_drm.cpp'
@@ -414,6 +446,7 @@ dependencies = [
     lua,
     threads,
     wlcln,
+    gpu_deps,
     xkb,
     exiv,
     # image support

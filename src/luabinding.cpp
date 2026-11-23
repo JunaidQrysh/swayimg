@@ -204,11 +204,15 @@ void LuaRootApi::bind()
 {
     // register timer for deferred procedure call
     Application::self().add_fdpoll(defer_timer, [this] {
-        assert(defer_fn);
         defer_timer.reset(0, 0);
-        lua.call(*defer_fn);
-        lua.remove_ref(defer_fn);
+        if (!defer_fn) {
+            return;
+        }
+        // detach callback before calling it: it may schedule a new one
+        auto* fn = defer_fn;
         defer_fn = nullptr;
+        lua.call(*fn);
+        lua.remove_ref(fn);
     });
 
     add_property("appid", &LuaRootApi::get_appid, &LuaRootApi::set_appid);
@@ -1253,6 +1257,7 @@ void LuaGalleryApi::bind()
     add_property_wo("selected_color", &LuaGalleryApi::set_selected_color);
     add_property_wo("unselected_color", &LuaGalleryApi::set_unselected_color);
     add_property_wo("hover", &LuaGalleryApi::set_hover);
+    add_property_wo("scroll_speed", &LuaGalleryApi::set_scroll_speed);
     add_property_wo("pstore", &LuaGalleryApi::set_pstore);
     add_property_wo("pstore_path", &LuaGalleryApi::set_pstore_path);
     add_property_wo("preload", &LuaGalleryApi::set_preload);
@@ -1323,6 +1328,11 @@ void LuaGalleryApi::set_unselected_color(const luacolor_t value)
 void LuaGalleryApi::set_hover(const bool value)
 {
     static_cast<Gallery*>(mode)->enable_hover(value);
+}
+
+void LuaGalleryApi::set_scroll_speed(const double value)
+{
+    static_cast<Gallery*>(mode)->set_scroll_speed(value);
 }
 
 void LuaGalleryApi::set_pstore(const bool value)

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "canvas.hpp"
 #include "pixmap.hpp"
 
 #include <filesystem>
@@ -49,13 +50,13 @@ public:
     virtual ~Image() = default;
 
     /**
-     * Draw image on pixmap surface.
+     * Draw image on canvas.
      * @param frame frame index to draw
      * @param target surface to draw on
      * @param scale image scale factor
      * @param x,y top-left coordinates on target surface
      */
-    virtual void draw(const size_t frame, Pixmap& target, const double scale,
+    virtual void draw(const size_t frame, Canvas& target, const double scale,
                       const ssize_t x, const ssize_t y);
 
     /**

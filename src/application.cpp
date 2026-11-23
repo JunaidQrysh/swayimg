@@ -6,6 +6,7 @@
 
 #include "buildconf.hpp"
 #include "defaults.hpp"
+#include "embeddedvideo.hpp"
 #include "fsmonitor.hpp"
 #include "gallery.hpp"
 #include "imagelist.hpp"
@@ -13,6 +14,7 @@
 #include "luaengine.hpp"
 #include "slideshow.hpp"
 #include "text.hpp"
+#include "videoplayer.hpp"
 #include "viewer.hpp"
 
 #ifdef HAVE_WAYLAND
@@ -28,6 +30,7 @@
 #include <poll.h>
 
 #include <csignal>
+
 
 Application& Application::self()
 {
@@ -123,6 +126,7 @@ int Application::run()
 
     event_loop();
     current_mode()->deactivate();
+    Viewer::self().release_video(); // free GPU resources while UI exists
     ui->stop();
 
     return exit_code;
@@ -147,11 +151,43 @@ void Application::set_mode(const AppMode::Type mode)
 
         app_mode = current_mode();
         const ImageEntryPtr entry = app_mode->get_current();
+
+        // open videos from gallery in external player instead of viewer
+        if (active_mode == AppMode::Gallery && mode == AppMode::Viewer &&
+            VideoPlayer::is_video(entry) && !EmbeddedVideo::available()) {
+            VideoPlayer::open(entry->path);
+            return;
+        }
+
         app_mode->deactivate();
 
+        const AppMode::Type prev_mode = active_mode;
         active_mode = mode;
         app_mode = current_mode();
-        app_mode->activate(entry, ui->get_window_size());
+        const Size wnd = ui->get_window_size();
+        app_mode->activate(entry, wnd);
+
+        // animated transition between gallery and viewer
+        transition.active = false;
+        Viewer& viewer = Viewer::self();
+        Gallery& gallery = Gallery::self();
+        if (prev_mode == AppMode::Gallery && mode == AppMode::Viewer) {
+            const Rectangle tile =
+                gallery.get_tile_rect(viewer.get_current(), wnd);
+            if (tile) {
+                viewer.transition_from(tile, gallery.thumb_cover());
+                transition = { .active = true, .opening = true, .t = 0.0 };
+            }
+        } else if (prev_mode == AppMode::Viewer &&
+                   mode == AppMode::Gallery) {
+            const Rectangle tile =
+                gallery.get_tile_rect(viewer.get_current(), wnd);
+            if (tile) {
+                viewer.transition_to(tile, gallery.thumb_cover());
+                transition = { .active = true, .opening = false, .t = 0.0 };
+            }
+        }
+        redraw();
     }
 }
 
@@ -479,20 +515,71 @@ void Application::handle_event(const AppEvent::WindowRescale& event)
 
 void Application::handle_event(const AppEvent::WindowRedraw&)
 {
-    Pixmap* wnd = ui->lock_surface();
-    if (wnd) {
+    AppMode* mode = current_mode();
+    if (!mode->ready_to_draw()) {
+        return; // keep previous frame on the screen
+    }
+
+    Canvas* canvas = ui->lock_surface();
+    if (canvas) {
         const Log::PerfTimer timer;
 
-        current_mode()->window_redraw(*wnd);
-        Text::self().draw(*wnd);
+        // advance animations (frame time is paced by the compositor)
+        const auto now = std::chrono::steady_clock::now();
+        double dt = 1.0 / 60.0;
+        if (animating) {
+            dt = std::chrono::duration<double>(now - last_frame).count();
+            dt = std::clamp(dt, 0.001, 0.05);
+        }
+        last_frame = now;
+        animating = mode->animate(dt);
+
+        if (transition.active) {
+            // gallery in the back, fading viewer layer, image on top
+            Viewer& viewer = Viewer::self();
+            Gallery& gallery = Gallery::self();
+            if (!transition.opening) {
+                animating |= viewer.animate(dt); // drives closing animation
+            }
+            transition.t = std::min(1.0, transition.t + dt / TRANSITION_TIME);
+            const double inv = 1.0 - transition.t;
+            const double e = 1.0 - inv * inv * inv; // ease out
+            gallery.window_redraw(*canvas);
+            canvas->begin_layer();
+            viewer.window_redraw(*canvas);
+            canvas->end_layer(transition.opening ? e : 1.0 - e);
+            viewer.draw_photo(*canvas);
+            if (transition.t >= 1.0) {
+                transition.active = false;
+                if (!transition.opening) {
+                    animating = true; // redraw gallery without overlay
+                }
+            } else {
+                animating = true;
+            }
+        } else {
+            mode->window_redraw(*canvas);
+        }
+        Text::self().draw(*canvas);
         ui->commit_surface();
 
         if (on_redraw_complete) {
             on_redraw_complete();
         }
 
+        // prepare renderer and video player once after the first frame
+        if (!video_prewarmed) {
+            video_prewarmed = true;
+            ui->warmup();
+            Viewer::self().prewarm_video();
+        }
+
         if (Log::verbose_enable()) {
             Log::verbose("Redraw in {:.6f} sec", timer.time());
+        }
+
+        if (animating) {
+            redraw(); // next animation frame
         }
     }
 }
@@ -504,12 +591,19 @@ void Application::handle_event(const AppEvent::KeyPress& event)
 
 void Application::handle_event(const AppEvent::Scroll& event)
 {
-    current_mode()->handle_scroll(event.kmods, event.delta_h, event.delta_v);
+    current_mode()->handle_scroll(event.kmods, event.delta_h, event.delta_v,
+                                  event.finger, event.stop, event.time);
 }
 
 void Application::handle_event(const AppEvent::MouseClick& event)
 {
-    current_mode()->handle_mclick(event.mouse, event.pointer);
+    AppMode* mode = current_mode();
+    if (mode->handle_mbutton(event.button, event.pressed, event.pointer)) {
+        return; // consumed by the mode (e.g. embedded video controls)
+    }
+    if (event.pressed) {
+        mode->handle_mclick(event.mouse, event.pointer);
+    }
 }
 
 void Application::handle_event(const AppEvent::MouseMove& event)
@@ -519,7 +613,11 @@ void Application::handle_event(const AppEvent::MouseMove& event)
 
 void Application::handle_event(const AppEvent::GesturePinch& event)
 {
-    current_mode()->handle_pinch(event.scale_delta);
+    if (event.end) {
+        current_mode()->handle_pinch_end();
+    } else {
+        current_mode()->handle_pinch(event.scale_delta, event.dx, event.dy);
+    }
 }
 
 void Application::handle_event(const AppEvent::Signal& event)
