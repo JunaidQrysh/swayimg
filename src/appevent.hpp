@@ -93,6 +93,11 @@ struct FileRemove {
     std::filesystem::path path; ///< Path to the file
 };
 
+/** Function to execute in the main thread (results of background jobs). */
+struct Callback {
+    std::function<void()> fn; ///< Function to call
+};
+
 // clang-format off
 using Holder = std::variant<WindowClose,
                             WindowRedraw,
@@ -107,7 +112,8 @@ using Holder = std::variant<WindowClose,
                             DragAndDrop,
                             FileCreate,
                             FileModify,
-                            FileRemove>;
+                            FileRemove,
+                            Callback>;
 // clang-format on
 
 // event handler

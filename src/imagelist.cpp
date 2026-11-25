@@ -172,6 +172,17 @@ ImageList::add(const std::vector<std::filesystem::path>& sources)
     return added;
 }
 
+ImageEntryPtr ImageList::add_placeholder(const std::filesystem::path& path,
+                                         const std::time_t mtime)
+{
+    const std::scoped_lock lock(mutex);
+    const ImageEntryPtr entry = add_entry(path, mtime, 0);
+    if (entry) {
+        sort();
+    }
+    return entry;
+}
+
 ImageList::EntriesArray
 ImageList::remove(const std::vector<std::filesystem::path>& sources)
 {
@@ -547,7 +558,7 @@ ImageList::EntriesArray ImageList::add_dir(const std::filesystem::path& path)
         } else if (child_ec) {
             Log::warning("File {} skipped: {}", child_path.string(),
                          child_ec.message());
-        } else {
+        } else if (!file_filter || file_filter(child_path)) {
             const ImageEntryPtr entry = add_file(child_path);
             if (entry) {
                 added.push_back(entry);

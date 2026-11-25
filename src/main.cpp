@@ -281,8 +281,8 @@ int main(int argc, char* argv[])
                  puts("usage: swayimg [option]... [file]...");
                  puts("show images from file(s).");
                  puts("if file is -, read standard input.");
-                 puts("if no file specified - read all files from the "
-                      "current directory.\n");
+                 puts("if no file specified - show photos from the saved "
+                      "albums.\n");
                  puts("mandatory arguments to long options are mandatory for "
                       "short options too.");
                  args.print();
@@ -297,9 +297,7 @@ int main(int argc, char* argv[])
     for (int i = argn; i < argc; ++i) {
         params.sources.emplace_back(argv[i]);
     }
-    if (params.sources.empty()) {
-        params.sources.emplace_back("."); // all from the current dir by default
-    }
+    // no sources: open Photos view of the library
 
     return Application::self().run();
 }

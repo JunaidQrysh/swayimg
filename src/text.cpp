@@ -57,6 +57,42 @@ std::wstring to_wide(const std::string& text)
     return wide;
 }
 
+/**
+ * Get path for display: home directory replaced with "~", long paths
+ * shortened in the middle (beginning and file name stay visible).
+ * @param path full path
+ * @return display path
+ */
+std::string short_path(const std::filesystem::path& path)
+{
+    constexpr size_t max_len = 100;
+
+    std::string text = path.string();
+    const char* home = std::getenv("HOME");
+    if (home && *home) {
+        const std::string prefix = std::string(home) + '/';
+        if (text.starts_with(prefix)) {
+            text = "~/" + text.substr(prefix.size());
+        }
+    }
+
+    const std::wstring wide = to_wide(text);
+    if (wide.size() <= max_len) {
+        return text;
+    }
+    const size_t tail = max_len * 2 / 3;
+    const size_t head = max_len - tail - 1;
+    std::wstring result = wide.substr(0, head) + L'…' +
+        wide.substr(wide.size() - tail);
+    std::string out(result.size() * MB_CUR_MAX + 1, 0);
+    const size_t len = std::wcstombs(out.data(), result.c_str(), out.size());
+    if (len == static_cast<size_t>(-1)) {
+        return text;
+    }
+    out.resize(len);
+    return out;
+}
+
 } // anonymous namespace
 
 Text& Text::self()
@@ -227,6 +263,7 @@ void Text::reset(const ImageEntryPtr& entry)
     fields.clear();
 
     set_field(FIELD_FILE_PATH, entry->path);
+    set_field(FIELD_FILE_SHORT_PATH, short_path(entry->path));
     set_field(FIELD_FILE_DIR, entry->path.parent_path().filename());
     set_field(FIELD_FILE_NAME, entry->path.filename());
     set_field(FIELD_FILE_SIZE, std::to_wstring(entry->size));
@@ -354,6 +391,26 @@ void Text::draw(const Position blkpos, Canvas& target) const
                           background);
     }
 
+    // left blocks must not run into the block on the right
+    ssize_t right_x = -1;
+    ssize_t right_top = 0;
+    ssize_t right_bottom = 0;
+    if (blkpos == Position::TopLeft || blkpos == Position::BottomLeft) {
+        const Position opposite = blkpos == Position::TopLeft
+            ? Position::TopRight
+            : Position::BottomRight;
+        const KeyValBlock& rb = blocks[static_cast<size_t>(opposite)];
+        if (rb.total_width && rb.total_height) {
+            right_x = static_cast<ssize_t>(tsz.width) - rb.total_width -
+                padding * 2;
+            right_top = opposite == Position::TopRight
+                ? static_cast<ssize_t>(padding)
+                : static_cast<ssize_t>(tsz.height) - rb.total_height -
+                    padding;
+            right_bottom = right_top + rb.total_height;
+        }
+    }
+
     // draw text lines
     for (const auto& line : block.lines) {
         if (line.value.text.empty()) {
@@ -361,12 +418,17 @@ void Text::draw(const Position blkpos, Canvas& target) const
         }
 
         Point pos { .x = x, .y = y };
+        const bool beside_right =
+            right_x >= 0 && y < right_bottom && y + block.line_height > right_top;
+        const ssize_t limit = beside_right
+            ? right_x
+            : static_cast<ssize_t>(tsz.width) - padding;
 
         if (!line.key.text.empty()) {
             line.key.draw(target, pos, foreground, shadow);
             pos.x += block.key_width;
         }
-        line.value.draw(target, pos, foreground, shadow);
+        line.value.draw(target, pos, foreground, shadow, limit);
 
         y += block.line_height;
     }
@@ -407,9 +469,46 @@ size_t Text::TextLine::margin() const
 }
 
 void Text::TextLine::draw(Canvas& target, const Point& pos, const argb_t color,
-                          const argb_t shadow) const
+                          const argb_t shadow, const ssize_t limit) const
 {
-    const ssize_t max_x = target.size().width;
+    const ssize_t max_x = limit >= 0
+        ? std::min<ssize_t>(limit, target.size().width)
+        : static_cast<ssize_t>(target.size().width);
+
+    // cut long text in the middle: beginning and end (e.g. file name of a
+    // path) stay visible
+    const std::wstring* out = &text;
+    std::wstring cut;
+    if (limit >= 0 && pos.x + static_cast<ssize_t>(width()) > max_x) {
+        const auto glyph_w = [](const wchar_t ch) -> ssize_t {
+            const Pixmap* glyph = fonts.get_glyph(ch);
+            return glyph ? glyph->width() : 0;
+        };
+        const ssize_t avail = max_x - pos.x -
+            static_cast<ssize_t>(margin()) - glyph_w(L'…');
+        size_t tail = 0;
+        ssize_t tail_w = 0;
+        while (tail < text.size()) {
+            const ssize_t w = glyph_w(text[text.size() - tail - 1]);
+            if (tail_w + w > avail / 2) {
+                break;
+            }
+            tail_w += w;
+            ++tail;
+        }
+        size_t head = 0;
+        ssize_t head_w = 0;
+        while (head + tail < text.size()) {
+            const ssize_t w = glyph_w(text[head]);
+            if (head_w + w > avail - tail_w) {
+                break;
+            }
+            head_w += w;
+            ++head;
+        }
+        cut = text.substr(0, head) + L'…' + text.substr(text.size() - tail);
+        out = &cut;
+    }
 
     Point pt = pos;
     pt.x += margin();
@@ -420,7 +519,7 @@ void Text::TextLine::draw(Canvas& target, const Point& pos, const argb_t color,
         : std::max<ssize_t>(height() / SHADOW_FACTOR, 1);
 
     // draw glyphs
-    for (const wchar_t ch : text) {
+    for (const wchar_t ch : *out) {
         const Pixmap* glyph = fonts.get_glyph(ch);
         if (glyph) {
             if (glyph->format() == Pixmap::ARGB) {

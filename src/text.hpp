@@ -28,6 +28,7 @@ public:
 
     // Field IDs
     static constexpr const char* FIELD_FILE_PATH = "path";
+    static constexpr const char* FIELD_FILE_SHORT_PATH = "shortpath";
     static constexpr const char* FIELD_FILE_DIR = "dir";
     static constexpr const char* FIELD_FILE_NAME = "name";
     static constexpr const wchar_t* FIELD_FILE_SIZE = L"size";
@@ -218,9 +219,10 @@ private:
          * @param pos text position on target pixmap
          * @param color text color
          * @param shadow shadow color
+         * @param max_x right limit: longer text is cut with ellipsis
          */
         void draw(Canvas& target, const Point& pos, const argb_t color,
-                  const argb_t shadow) const;
+                  const argb_t shadow, const ssize_t max_x = -1) const;
 
         std::wstring text; ///< Displayed text
     };

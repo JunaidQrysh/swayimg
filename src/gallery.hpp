@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -168,6 +169,18 @@ public:
                       const double dy) override;
     bool ready_to_draw() override;
     bool animate(const double dt) override;
+    bool handle_mbutton(const InputMouse::mouse_btn_t button,
+                        const bool pressed, const Point& pos) override;
+
+    /**
+     * Check if there is a thumbnail at specified position.
+     * @param pos window coordinates
+     * @return true if a thumbnail is under the position
+     */
+    [[nodiscard]] bool thumb_at(const Point& pos) const
+    {
+        return layout.at(pos) != nullptr;
+    }
 
     /**
      * Scroll the gallery (mouse wheel or touchpad).
@@ -189,6 +202,32 @@ public:
      * @return true if thumbnail covers the tile, false if fit
      */
     [[nodiscard]] bool thumb_cover() const { return aspect == Aspect::Fill; }
+
+    /**
+     * Set content insets covered by overlays (header, floating controls).
+     * @param top,bottom inset sizes in pixels
+     */
+    void set_margins(const size_t top, const size_t bottom);
+
+    /**
+     * Drop all cached thumbnails (the image list was replaced).
+     * Must be called while the gallery is not active.
+     */
+    void drop_cache();
+
+    /**
+     * Get window background color.
+     * @return window color
+     */
+    [[nodiscard]] argb_t get_window_color() const { return clr_window; }
+
+    /** Tile overlay drawing callback (e.g. album captions). */
+    using TileOverlay = std::function<void(Canvas&, const ImageEntryPtr&,
+                                           const Rectangle&, double)>;
+    TileOverlay tile_overlay; ///< Drawn on top of each thumbnail
+
+    /** Called from a loader thread when an image can't be decoded. */
+    std::function<void(const std::filesystem::path&)> on_load_failed;
 
 protected:
     void switch_current() override;
@@ -212,6 +251,24 @@ private:
      */
     [[nodiscard]] Rectangle tile_rect(const Layout::Thumbnail& tlay,
                                       const Size& wnd_size) const;
+
+    /**
+     * Draw scroll bar.
+     * @param wnd target window
+     */
+    void draw_scrollbar(Canvas& wnd);
+
+    /**
+     * Check if point is inside scroll bar hit area.
+     * @param pos window coordinates
+     */
+    [[nodiscard]] bool on_scrollbar(const Point& pos) const;
+
+    /**
+     * Scroll to follow the dragged scroll bar thumb.
+     * @param y pointer vertical position
+     */
+    void drag_scrollbar(const ssize_t y);
 
     /**
      * Refresh view: clear and load thumbnails.
@@ -308,6 +365,19 @@ private:
     bool free_scroll = false; ///< Scrolling by wheel/touchpad (not keyboard)
     FlingTracker fling_tracker; ///< Touchpad fling velocity estimation
     double fling_carry = 0; ///< Fling velocity interrupted by a new gesture
+
+    // scroll bar
+    struct ScrollBar {
+        double alpha = 0;      ///< Current visibility
+        double last_pos = 0;   ///< Scroll offset at last frame
+        std::chrono::steady_clock::time_point show_until; ///< Hide time
+        FdTimer timer;         ///< Timer to start hiding
+        bool hover = false;    ///< Pointer is over the scroll bar
+        bool drag = false;     ///< Thumb is dragged
+        ssize_t drag_offset = 0; ///< Pointer offset inside the thumb
+        Rectangle track;       ///< Track area from the last frame
+        Rectangle thumb;       ///< Thumb area from the last frame
+    } sbar;
 
     bool preload;      ///< Enable/disable preloading of invisible thumbnails
     size_t cache_size; ///< Max number of thumbnails in cache

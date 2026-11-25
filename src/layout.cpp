@@ -90,6 +90,43 @@ void Layout::set_padding(const size_t padding)
     }
 }
 
+void Layout::set_margins(const size_t top, const size_t bottom)
+{
+    if (top == margin_top && bottom == margin_bottom) {
+        return;
+    }
+    const bool anchored = window && sel_entry && !sel_entry->removed && total;
+    const double anchor = anchored ? row_top(selected_row()) - scroll : 0;
+
+    margin_top = top;
+    margin_bottom = bottom;
+    recalc();
+
+    if (anchored && sel_entry) {
+        velocity = 0;
+        target =
+            std::clamp(row_top(selected_row()) - anchor, 0.0, max_scroll());
+        scroll = target;
+        rebuild();
+    }
+}
+
+void Layout::set_scroll(const double offset)
+{
+    velocity = 0;
+    target = std::clamp(offset, 0.0, max_scroll());
+    scroll = target;
+    rebuild();
+}
+
+void Layout::reset_scroll()
+{
+    velocity = 0;
+    scroll = 0;
+    target = 0;
+    rebuild();
+}
+
 void Layout::select(const ImageEntryPtr& image)
 {
     sel_entry = image;
@@ -111,8 +148,9 @@ void Layout::select_keep_scroll(const ImageEntryPtr& image)
         return;
     }
 
-    const double top = row_top(selected_row()) - thumb_padding;
-    const double bottom = row_top(selected_row()) + thumb_size;
+    const double top = row_top(selected_row()) - thumb_padding - margin_top;
+    const double bottom =
+        row_top(selected_row()) + thumb_size + margin_bottom;
     const double view = std::clamp(scroll, 0.0, max_scroll());
     double new_scroll = view;
     if (bottom <= view || top >= view + window.height) {
@@ -337,7 +375,9 @@ bool Layout::keep_selection_visible()
     const double cell = thumb_size + thumb_padding;
     const size_t row = selected_row();
     const double top = row_top(row) - scroll;
-    if (top >= 0 && top + thumb_size <= window.height) {
+    const double avail = view_height();
+    if (top >= static_cast<double>(margin_top) &&
+        top + thumb_size <= margin_top + avail) {
         return false; // fully visible
     }
 
@@ -345,7 +385,7 @@ bool Layout::keep_selection_visible()
     const double base = scroll - offset_y - thumb_padding;
     ssize_t first = static_cast<ssize_t>(std::ceil(base / cell));
     ssize_t last = static_cast<ssize_t>(
-        std::floor((base + window.height - thumb_size) / cell));
+        std::floor((base + avail - thumb_size) / cell));
     first = std::clamp<ssize_t>(first, 0, total_rows - 1);
     last = std::clamp<ssize_t>(last, 0, total_rows - 1);
 
@@ -353,7 +393,7 @@ bool Layout::keep_selection_visible()
     if (first > last) {
         // thumbnail is larger than window: use the central row
         new_row = std::clamp<ssize_t>(
-            std::floor((scroll + window.height / 2.0 - offset_y) / cell), 0,
+            std::floor((scroll + avail / 2.0 - offset_y) / cell), 0,
             total_rows - 1);
     } else {
         new_row = std::cmp_less(row, first) ? first : last;
@@ -393,15 +433,14 @@ void Layout::recalc()
 
     const size_t cell = thumb_size + thumb_padding;
     columns = std::max(static_cast<size_t>(1), window.width / cell);
-    rows = std::max(static_cast<size_t>(1), window.height / cell);
+    const size_t avail = static_cast<size_t>(view_height());
+    rows = std::max(static_cast<size_t>(1), avail / cell);
     total_rows = (total + columns - 1) / columns;
 
     const size_t used_cols = std::min(columns, total);
     offset_x = (window.width - std::min(window.width, used_cols * cell)) / 2;
     const size_t content_height = total_rows * cell;
-    offset_y = content_height < window.height
-        ? (window.height - content_height) / 2
-        : 0;
+    offset_y = content_height < avail ? (avail - content_height) / 2 : 0;
 
     const double max = max_scroll();
     target = std::clamp(target, 0.0, max);
@@ -425,7 +464,7 @@ void Layout::rebuild()
 
     const double cell = thumb_size + thumb_padding;
     size_t row = static_cast<size_t>(
-        std::max(0.0, std::floor((scroll - offset_y) / cell)));
+        std::max(0.0, std::floor((scroll - offset_y - margin_top) / cell)));
     size_t rel_row = 0;
 
     for (; row < total_rows; ++row) {
@@ -459,12 +498,19 @@ void Layout::rebuild()
 double Layout::max_scroll() const
 {
     const double content = total_rows * (thumb_size + thumb_padding);
-    return std::max(0.0, content - window.height);
+    return std::max(0.0, content - view_height());
+}
+
+double Layout::view_height() const
+{
+    const size_t insets = margin_top + margin_bottom;
+    return window.height > insets ? window.height - insets : 1;
 }
 
 double Layout::row_top(const size_t row) const
 {
-    return offset_y + static_cast<double>(row * (thumb_size + thumb_padding)) +
+    return margin_top + offset_y +
+        static_cast<double>(row * (thumb_size + thumb_padding)) +
         thumb_padding;
 }
 
@@ -488,10 +534,10 @@ void Layout::ensure_visible()
     const double bottom = top + thumb_size;
 
     double new_target = target;
-    if (top - thumb_padding < new_target) {
-        new_target = top - thumb_padding;
-    } else if (bottom > new_target + window.height) {
-        new_target = bottom - window.height;
+    if (top - thumb_padding - margin_top < new_target) {
+        new_target = top - thumb_padding - margin_top;
+    } else if (bottom > new_target + window.height - margin_bottom) {
+        new_target = bottom - (window.height - margin_bottom);
     }
     scroll_to(new_target);
 }
@@ -506,7 +552,8 @@ void Layout::center_selection()
         std::max<ssize_t>(0, static_cast<ssize_t>(selected_row()) -
                                  static_cast<ssize_t>(rows / 2));
     velocity = 0;
-    target = std::clamp(row_top(first) - thumb_padding, 0.0, max_scroll());
+    target = std::clamp(row_top(first) - thumb_padding - margin_top, 0.0,
+                        max_scroll());
     scroll = target;
     rebuild();
 }

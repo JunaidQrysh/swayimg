@@ -23,17 +23,18 @@ namespace VideoPlayer {
  */
 bool is_video(const ImageEntryPtr& entry)
 {
+    return entry && !entry->is_special() && is_video(entry->path);
+}
+
+bool is_video(const std::filesystem::path& path)
+{
     static constexpr std::array<std::string_view, 17> extensions = {
         ".mp4", ".m4v", ".mkv", ".webm", ".mov",  ".avi",  ".wmv",
         ".flv", ".mpg", ".mpeg", ".ts",  ".m2ts", ".mts", ".3gp",
         ".ogv", ".vob", ".asf",
     };
 
-    if (!entry || entry->is_special()) {
-        return false;
-    }
-
-    std::string ext = entry->path.extension().string();
+    std::string ext = path.extension().string();
     std::ranges::transform(ext, ext.begin(), [](const unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });

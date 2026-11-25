@@ -51,6 +51,12 @@ public:
     }
 
     /**
+     * Check if value is locked (set explicitly, e.g. from command line).
+     * @return true if locked
+     */
+    [[nodiscard]] bool is_locked() const { return locked; }
+
+    /**
      * Unlock value.
      * @return value reference
      */

@@ -40,6 +40,7 @@ xkb = dependency('xkbcommon')
 fontconfig = dependency('fontconfig')
 freetype = dependency('freetype2', version: '>=2.13.1')
 threads = dependency('threads')
+sdbus = dependency('libsystemd', required: false) # folder chooser portal
 lua = dependency(get_option('liblua'))
 
 # wayland support
@@ -218,6 +219,7 @@ conf.set('HAVE_LIBWEBP', webp.found())
 conf.set('HAVE_KRITA', krita.found())
 conf.set('HAVE_VIDEO', video.found())
 conf.set('HAVE_HWDECODE', hwdecode_found)
+conf.set('HAVE_SDBUS', sdbus.found())
 conf.set_quoted('APP_VERSION', version)
 configure_file(output: 'buildconf.hpp', configuration: conf)
 
@@ -347,12 +349,14 @@ endif
 sources = [
     'src/application.cpp',
     'src/appmode.cpp',
+    'src/clipboard.cpp',
     'src/defaults.cpp',
     'src/embeddedvideo.cpp',
     'src/fdevent.cpp',
     'src/fdothumb.cpp',
     'src/font.cpp',
     'src/formatfactory.cpp',
+    'src/folderpicker.cpp',
     'src/fsmonitor.cpp',
     'src/gallery.cpp',
     'src/geometry.cpp',
@@ -361,11 +365,13 @@ sources = [
     'src/imagelist.cpp',
     'src/input.cpp',
     'src/layout.cpp',
+    'src/library.cpp',
     'src/luabinding.cpp',
     'src/luaengine.cpp',
     'src/pixmap.cpp',
     'src/render.cpp',
     'src/resources.cpp',
+    'src/shapes.cpp',
     'src/slideshow.cpp',
     'src/swcanvas.cpp',
     'src/text.cpp',
@@ -455,6 +461,7 @@ dependencies = [
     inotify,
     lua,
     threads,
+    sdbus,
     wlcln,
     gpu_deps,
     xkb,

@@ -9,8 +9,10 @@
 #include "fdothumb.hpp"
 #include "formatfactory.hpp"
 #include "imagelist.hpp"
+#include "log.hpp"
 #include "render.hpp"
 #include "resources.hpp"
+#include "shapes.hpp"
 #include "text.hpp"
 #include "videoplayer.hpp"
 
@@ -47,6 +49,19 @@ constexpr double FLING_MIN_VELOCITY = 300.0;
 constexpr double FLING_MAX_VELOCITY = 20000.0;
 // Mouse wheel: scroll distance for one step relative to thumbnail size
 constexpr double WHEEL_SCROLL_FACTOR = 0.6;
+
+// Scroll bar: time to stay visible after scrolling, fade speed, sizes
+constexpr std::chrono::milliseconds SCROLLBAR_LINGER(1000);
+constexpr double SCROLLBAR_FADE_SPEED = 10.0;
+constexpr double SCROLLBAR_HANDLE_W = 30;
+constexpr double SCROLLBAR_HANDLE_H = 54;
+constexpr double SCROLLBAR_ARROW_W = 10;
+constexpr double SCROLLBAR_ARROW_H = 6;
+constexpr double SCROLLBAR_ARROW_GAP = 5;
+constexpr double SCROLLBAR_MARGIN = 6;
+constexpr argb_t SCROLLBAR_CLR = { 0xf0, 0x30, 0x30, 0x33 };
+constexpr argb_t SCROLLBAR_CLR_ACTIVE = { 0xf8, 0x48, 0x48, 0x4c };
+constexpr argb_t SCROLLBAR_ARROW_CLR = { 0xff, 0xd8, 0xd8, 0xdc };
 
 /** Ease out cubic. */
 static double ease_out(const double t)
@@ -247,11 +262,41 @@ void Gallery::set_pstore_path(const std::filesystem::path& path)
     pstore_path = path;
 }
 
+void Gallery::set_margins(const size_t top, const size_t bottom)
+{
+    layout.set_margins(top, bottom);
+    if (is_active()) {
+        refresh();
+        Application::redraw();
+    }
+}
+
+void Gallery::drop_cache()
+{
+    tpool.cancel();
+    tpool.wait();
+    const std::scoped_lock lock(mutex);
+    thumbs.clear();
+    crld_thumbs.clear();
+    fade.clear();
+    sel_last = nullptr;
+    sel_prev = nullptr;
+    sel_anim = 1.0;
+    layout.select(nullptr);
+    layout.reset_scroll();
+}
+
 void Gallery::initialize()
 {
     Application::self().add_fdpoll(warmup_timer, [this] {
         warmup_timer.reset(0, 0);
         Application::redraw();
+    });
+    Application::self().add_fdpoll(sbar.timer, [this] {
+        sbar.timer.reset(0, 0);
+        if (is_active()) {
+            Application::redraw(); // start hiding the scroll bar
+        }
     });
 }
 
@@ -279,6 +324,13 @@ void Gallery::activate(const ImageEntryPtr& entry, const Size& wnd)
     sel_prev = nullptr;
     sel_anim = 1.0;
     free_scroll = false;
+
+    // scroll bar appears only on scrolling
+    sbar.last_pos = layout.get_scroll();
+    sbar.alpha = 0;
+    sbar.drag = false;
+    sbar.hover = false;
+    sbar.show_until = {};
 }
 
 void Gallery::deactivate()
@@ -338,10 +390,26 @@ void Gallery::window_redraw(Canvas& wnd)
     if (tsel) {
         draw(*tsel, wnd);
     }
+
+    draw_scrollbar(wnd);
 }
 
 void Gallery::handle_mmove(const InputMouse&, const Point& pos, const Point&)
 {
+    if (sbar.drag) {
+        drag_scrollbar(pos.y);
+        return;
+    }
+
+    const bool hover = on_scrollbar(pos);
+    if (hover != sbar.hover) {
+        sbar.hover = hover;
+        Application::redraw();
+    }
+    if (hover) {
+        return;
+    }
+
     if (hover_select && layout.select(pos)) {
         switch_current();
     }
@@ -520,6 +588,10 @@ void Gallery::draw(const Layout::Thumbnail& tlay, Canvas& wnd)
         wnd.rectangle(border, clr_border, border_size);
     }
 
+    if (tile_overlay) {
+        tile_overlay(wnd, tlay.img, bkg, opacity);
+    }
+
     // draw mark icon
     if (tlay.img->mark) {
         const ssize_t margin = 5;
@@ -599,6 +671,26 @@ bool Gallery::animate(const double dt)
         on_scrolled();
     }
 
+    // scroll bar: show while scrolling, hover or drag, then fade out
+    const double pos = layout.get_scroll();
+    const auto now = std::chrono::steady_clock::now();
+    if (pos != sbar.last_pos) {
+        sbar.last_pos = pos;
+        sbar.show_until = now + SCROLLBAR_LINGER;
+        sbar.timer.reset(SCROLLBAR_LINGER.count() + 20, 0);
+    }
+    const bool show = layout.get_max_scroll() > 0 &&
+        (sbar.drag || sbar.hover || now < sbar.show_until);
+    const double sb_target = show ? 1.0 : 0.0;
+    if (sbar.alpha != sb_target) {
+        sbar.alpha +=
+            (sb_target - sbar.alpha) * (1.0 - std::exp(-dt * SCROLLBAR_FADE_SPEED));
+        if (std::abs(sb_target - sbar.alpha) < 0.01) {
+            sbar.alpha = sb_target;
+        }
+        in_progress |= sbar.alpha != sb_target;
+    }
+
     // selection
     if (sel_anim < 1.0) {
         sel_anim = std::min(1.0, sel_anim + dt / SELECT_TIME);
@@ -674,6 +766,133 @@ void Gallery::handle_scroll_stop()
         layout.fling(velocity);
         Application::redraw();
     }
+}
+
+void Gallery::draw_scrollbar(Canvas& wnd)
+{
+    const double max = layout.get_max_scroll();
+    sbar.track = {};
+    sbar.thumb = {};
+    if (max <= 0) {
+        return;
+    }
+
+    const double scale = Application::get_ui()->get_scale();
+    const auto dp = [scale](const double px) {
+        return static_cast<ssize_t>(std::lround(px * scale));
+    };
+
+    // fixed size handle moving along the right edge
+    const Size wsz = wnd.size();
+    const ssize_t margin = dp(SCROLLBAR_MARGIN);
+    const size_t width = dp(SCROLLBAR_HANDLE_W);
+    const size_t height = dp(SCROLLBAR_HANDLE_H);
+    const ssize_t top = static_cast<ssize_t>(layout.get_margin_top()) + margin;
+    const ssize_t bottom = static_cast<ssize_t>(wsz.height) -
+        static_cast<ssize_t>(layout.get_margin_bottom()) - margin;
+    if (bottom - top < static_cast<ssize_t>(height) * 2) {
+        return; // window too small
+    }
+    const size_t track_len = bottom - top;
+
+    const double frac = std::clamp(layout.get_scroll() / max, 0.0, 1.0);
+    const ssize_t y =
+        top + static_cast<ssize_t>(std::lround((track_len - height) * frac));
+    const ssize_t x = static_cast<ssize_t>(wsz.width) - margin -
+        static_cast<ssize_t>(width);
+
+    // hover area: strip along the right edge
+    sbar.track = { x - margin, top, width + margin * 2, track_len };
+    sbar.thumb = { x, y, width, height };
+
+    if (sbar.alpha <= 0) {
+        return;
+    }
+
+    const auto fade = [this](argb_t clr) {
+        clr.a = static_cast<argb_t::channel>(clr.a * sbar.alpha);
+        return clr;
+    };
+    const bool active = sbar.hover || sbar.drag;
+    wnd.mask(Shapes::pill({ width, height }), { x, y },
+             fade(active ? SCROLLBAR_CLR_ACTIVE : SCROLLBAR_CLR));
+
+    // up/down arrows
+    const Size arrow { static_cast<size_t>(dp(SCROLLBAR_ARROW_W)),
+                       static_cast<size_t>(dp(SCROLLBAR_ARROW_H)) };
+    const ssize_t gap = dp(SCROLLBAR_ARROW_GAP) / 2;
+    const ssize_t ax = x + static_cast<ssize_t>(width / 2) -
+        static_cast<ssize_t>(arrow.width / 2);
+    const ssize_t cy = y + static_cast<ssize_t>(height / 2);
+    wnd.mask(Shapes::triangle(arrow, true),
+             { ax, cy - gap - static_cast<ssize_t>(arrow.height) },
+             fade(SCROLLBAR_ARROW_CLR));
+    wnd.mask(Shapes::triangle(arrow, false), { ax, cy + gap },
+             fade(SCROLLBAR_ARROW_CLR));
+}
+
+bool Gallery::on_scrollbar(const Point& pos) const
+{
+    const Rectangle& r = sbar.track;
+    return r.width && pos.x >= r.x &&
+        pos.x < r.x + static_cast<ssize_t>(r.width) && pos.y >= r.y &&
+        pos.y < r.y + static_cast<ssize_t>(r.height);
+}
+
+void Gallery::drag_scrollbar(const ssize_t y)
+{
+    const Rectangle& track = sbar.track;
+    const double max = layout.get_max_scroll();
+    if (!track.height || max <= 0 || track.height <= sbar.thumb.height) {
+        return;
+    }
+    const double range = track.height - sbar.thumb.height;
+    const double frac =
+        std::clamp((y - sbar.drag_offset - track.y) / range, 0.0, 1.0);
+
+    free_scroll = true;
+    layout.set_scroll(frac * max);
+    if (layout.keep_selection_visible()) {
+        follow_selection();
+    }
+    on_scrolled();
+    Application::redraw();
+}
+
+bool Gallery::handle_mbutton(const InputMouse::mouse_btn_t button,
+                             const bool pressed, const Point& pos)
+{
+    if (button != InputMouse::BUTTON_LEFT) {
+        return false;
+    }
+    if (!pressed) {
+        if (sbar.drag) {
+            sbar.drag = false;
+            sbar.hover = on_scrollbar(pos);
+            sbar.show_until =
+                std::chrono::steady_clock::now() + SCROLLBAR_LINGER;
+            sbar.timer.reset(SCROLLBAR_LINGER.count() + 20, 0);
+            Application::redraw();
+            return true;
+        }
+        return false;
+    }
+    if (!on_scrollbar(pos)) {
+        return false;
+    }
+
+    layout.stop_scroll();
+    sbar.drag = true;
+    const Rectangle& thumb = sbar.thumb;
+    if (pos.y >= thumb.y &&
+        pos.y < thumb.y + static_cast<ssize_t>(thumb.height)) {
+        sbar.drag_offset = pos.y - thumb.y; // grab the handle
+    } else {
+        sbar.drag_offset = thumb.height / 2; // jump to the position
+        drag_scrollbar(pos.y);
+    }
+    Application::redraw();
+    return true;
 }
 
 void Gallery::follow_selection()
@@ -786,6 +1005,15 @@ void Gallery::load_thumbnail(const ImageEntryPtr& entry)
         crld_thumbs.insert(entry);
     }
 
+    // directory placeholder (empty album): nothing to load
+    std::error_code dir_ec;
+    if (!entry->is_special() &&
+        std::filesystem::is_directory(entry->path, dir_ec)) {
+        const std::scoped_lock lock(mutex);
+        crld_thumbs.erase(entry);
+        return;
+    }
+
     const size_t thumb_size = layout.get_thumb_size();
 
     Pixmap pm;
@@ -807,6 +1035,11 @@ void Gallery::load_thumbnail(const ImageEntryPtr& entry)
         pm = FormatFactory::self().preview(entry, thumb_size,
                                            aspect == Aspect::Fill);
         if (!pm) {
+            Log::verbose("Unable to load {}, removed from the list",
+                         entry->path.string());
+            if (on_load_failed) {
+                on_load_failed(entry->path);
+            }
             Application::self().add_event(AppEvent::FileRemove { entry->path });
         } else if (pstore_enable && !entry->is_special()) {
             pstore_save(entry, pm);

@@ -63,10 +63,12 @@ public:
         close(fd);
     }
 
-    static void on_keyboard_key(void* data, struct wl_keyboard*, uint32_t,
-                                uint32_t, uint32_t key, uint32_t state)
+    static void on_keyboard_key(void* data, struct wl_keyboard*,
+                                uint32_t serial, uint32_t, uint32_t key,
+                                uint32_t state)
     {
         UiWayland* ui = reinterpret_cast<UiWayland*>(data);
+        ui->input_serial = serial;
 
         key += 8;
         if (state == WL_KEYBOARD_KEY_STATE_RELEASED) {
@@ -139,6 +141,7 @@ public:
                                   uint32_t state)
     {
         UiWayland* ui = reinterpret_cast<UiWayland*>(data);
+        ui->input_serial = serial;
 
         const InputMouse::mouse_btn_t btn = InputMouse::to_button(button);
         if (btn == InputMouse::NONE) {
@@ -403,6 +406,54 @@ public:
     static constexpr const wl_seat_listener seat_listener = {
         .capabilities = on_seat_capabilities,
         .name = on_seat_name,
+    };
+
+    /***************************************************************************
+     * Clipboard (selection) source handlers
+     **************************************************************************/
+    static void on_clip_target(void*, struct wl_data_source*, const char*) {}
+
+    static void on_clip_send(void* data, struct wl_data_source*, const char*,
+                             int32_t fd)
+    {
+        const Fd file(fd);
+        const UiWayland* ui = reinterpret_cast<const UiWayland*>(data);
+        const char* ptr = ui->clip_text.data();
+        size_t left = ui->clip_text.size();
+        while (left) {
+            const ssize_t rc = write(fd, ptr, left);
+            if (rc == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                Log::error(errno, "Unable to send clipboard data");
+                break;
+            }
+            ptr += rc;
+            left -= rc;
+        }
+    }
+
+    static void on_clip_cancelled(void* data, struct wl_data_source* src)
+    {
+        // another client took the selection
+        UiWayland* ui = reinterpret_cast<UiWayland*>(data);
+        if (ui->clip_source == src) {
+            ui->clip_source = nullptr;
+        }
+        wl_data_source_destroy(src);
+    }
+
+    static void on_clip_dnd(void*, struct wl_data_source*) {}
+    static void on_clip_action(void*, struct wl_data_source*, uint32_t) {}
+
+    static constexpr const wl_data_source_listener clip_listener = {
+        .target = on_clip_target,
+        .send = on_clip_send,
+        .cancelled = on_clip_cancelled,
+        .dnd_drop_performed = on_clip_dnd,
+        .dnd_finished = on_clip_dnd,
+        .action = on_clip_action,
     };
 
     /***************************************************************************
@@ -1201,6 +1252,31 @@ void UiWayland::set_ctype(ContentType type)
             break;
     }
     wp_content_type_v1_set_content_type(wl.ctype, content_type);
+}
+
+bool UiWayland::set_clipboard(const std::string& text)
+{
+    if (!wl.datadev_mgr || !wl.datadev) {
+        return false;
+    }
+
+    wl_data_source* src =
+        wl_data_device_manager_create_data_source(wl.datadev_mgr);
+    if (!src) {
+        return false;
+    }
+    clip_text = text;
+    wl_data_source_add_listener(src, &WaylandHandler::clip_listener, this);
+    for (const char* mime : { "text/plain;charset=utf-8", "text/plain",
+                              "UTF8_STRING", "STRING", "TEXT" }) {
+        wl_data_source_offer(src, mime);
+    }
+    wl_data_device_set_selection(wl.datadev, src, input_serial);
+
+    // the previous source gets "cancelled" and is destroyed there
+    clip_source = src;
+    wl_display_flush(wl.display);
+    return true;
 }
 
 void UiWayland::set_fullscreen(const bool enable)

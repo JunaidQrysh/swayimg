@@ -17,6 +17,13 @@ namespace VideoPlayer {
 bool is_video(const ImageEntryPtr& entry);
 
 /**
+ * Check if the file is a video file (by file extension).
+ * @param path file path
+ * @return true if file is a video file
+ */
+bool is_video(const std::filesystem::path& path);
+
+/**
  * Open file in an external video player (mpv), detached from swayimg.
  * @param path path to the file to open
  */

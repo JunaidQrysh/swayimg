@@ -5,6 +5,7 @@
 #include "appmode.hpp"
 
 #include "application.hpp"
+#include "library.hpp"
 #include "imagelist.hpp"
 #include "resources.hpp"
 
@@ -176,7 +177,10 @@ void AppMode::switch_current()
         text.reset(entry);
     } else {
         text.clear();
-        text.set_status("Image list is empty");
+        // library views show their own hint for empty lists
+        if (Library::self().get_view() == Library::View::None) {
+            text.set_status("Image list is empty");
+        }
     }
 
     if (on_image_change) {

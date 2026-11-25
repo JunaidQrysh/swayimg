@@ -943,6 +943,7 @@ The block position can be one of the following:
 The template string includes text and fields surrounded by curly braces:
 * `{name}`: File name of the currently viewed/selected image
 * `{dir}`: Parent directory name of the currently viewed/selected image
+* `{shortpath}`: Path for display: `~` for home, long paths shortened
 * `{path}`: Absolute path to the currently viewed/selected image
 * `{size}`: File size in bytes
 * `{sizehr}`: File size in human-readable format
@@ -1606,6 +1607,7 @@ The block position can be one of the following:
 The template string includes text and fields surrounded by curly braces:
 * `{name}`: File name of the currently viewed/selected image
 * `{dir}`: Parent directory name of the currently viewed/selected image
+* `{shortpath}`: Path for display: `~` for home, long paths shortened
 * `{path}`: Absolute path to the currently viewed/selected image
 * `{size}`: File size in bytes
 * `{sizehr}`: File size in human-readable format
@@ -2300,6 +2302,7 @@ The block position can be one of the following:
 The template string includes text and fields surrounded by curly braces:
 * `{name}`: File name of the currently viewed/selected image
 * `{dir}`: Parent directory name of the currently viewed/selected image
+* `{shortpath}`: Path for display: `~` for home, long paths shortened
 * `{path}`: Absolute path to the currently viewed/selected image
 * `{size}`: File size in bytes
 * `{sizehr}`: File size in human-readable format

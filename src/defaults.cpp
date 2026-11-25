@@ -5,6 +5,8 @@
 #include "defaults.hpp"
 
 #include "application.hpp"
+#include "clipboard.hpp"
+#include "library.hpp"
 #include "render.hpp"
 
 #include <cstdlib>
@@ -32,10 +34,30 @@ void next_frame(Viewer* mode, const bool forward)
     mode->enable_animation(false);
     mode->set_frame(frame);
 }
+/**
+ * Copy path of the current file to the clipboard.
+ * @param mode active mode
+ */
+void copy_path(AppMode* mode)
+{
+    const ImageEntryPtr entry = mode->get_current();
+    if (!entry || entry->is_special()) {
+        return;
+    }
+    if (Clipboard::copy(entry->path.string())) {
+        Library::self().toast("Path copied");
+    } else {
+        Library::self().toast("Unable to copy: no clipboard");
+    }
+}
 } // anonymous namespace
 
 void Defaults::viewer::bind_inputs(Viewer* mode)
 {
+    mode->bind_input(InputKeyboard { .key = XKB_KEY_c, .mods = KEYMOD_CTRL },
+                     [mode] {
+                         copy_path(mode);
+                     });
     // general management
     mode->bind_input(
         InputKeyboard { .key = XKB_KEY_Escape, .mods = KEYMOD_NONE }, [] {
@@ -277,6 +299,10 @@ void Defaults::slideshow::bind_inputs(Slideshow* mode)
 
 void Defaults::gallery::bind_inputs(Gallery* mode)
 {
+    mode->bind_input(InputKeyboard { .key = XKB_KEY_c, .mods = KEYMOD_CTRL },
+                     [mode] {
+                         copy_path(mode);
+                     });
     // general management
     mode->bind_input(
         InputKeyboard { .key = XKB_KEY_Escape, .mods = KEYMOD_NONE }, [] {
@@ -429,8 +455,10 @@ void Defaults::gallery::bind_inputs(Gallery* mode)
         InputMouse { .buttons = InputMouse::BUTTON_LEFT, .mods = KEYMOD_NONE },
         [mode] {
             const Point pos = Application::get_ui()->get_mouse();
-            mode->select(pos);
-            Application::self().set_mode(AppMode::Viewer);
+            if (mode->thumb_at(pos)) { // ignore clicks on empty space
+                mode->select(pos);
+                Application::self().set_mode(AppMode::Viewer);
+            }
         });
 
     mode->on_scroll = [mode, zoom_fn](const keymod_t kmods,

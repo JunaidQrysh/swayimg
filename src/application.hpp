@@ -19,6 +19,8 @@
 #include <mutex>
 #include <vector>
 
+class ImageList;
+
 class Application {
 public:
     /** File descriptor event handler. */
@@ -92,6 +94,14 @@ public:
     void remove_all_images();
 
     /**
+     * Replace the whole image list and show it in gallery mode.
+     * @param load function that fills the (cleared) image list
+     * @param select path of the entry to select (first entry if empty)
+     */
+    void replace_images(const std::function<void(ImageList&)>& load,
+                        const std::filesystem::path& select);
+
+    /**
      * Add file descriptor to monitor.
      * @param fd file descriptor to watch
      * @param handler callback
@@ -156,6 +166,7 @@ private:
     void handle_event(const AppEvent::FileCreate& event);
     void handle_event(const AppEvent::FileModify& event);
     void handle_event(const AppEvent::FileRemove& event);
+    void handle_event(const AppEvent::Callback& event);
 
     // Signal handler, see std::signal for details
     static void signal_handler(int signal);

@@ -180,6 +180,7 @@ public:
     void set_cursor(CursorShape shape) override;
     void set_ctype(ContentType type) override;
     void set_fullscreen(const bool enable) override;
+    bool set_clipboard(const std::string& text) override;
     [[nodiscard]] bool get_fullscreen() const override;
     Size get_window_size() override;
     void set_window_size(const Size& size) override;
@@ -259,6 +260,9 @@ private:
     Xkb xkb; ///< X keyboard extension
 
     uint32_t pointer_serial; ///< Current mouse serial from pointer enter
+    uint32_t input_serial = 0; ///< Serial of the last key/button press
+    struct wl_data_source* clip_source = nullptr; ///< Clipboard selection
+    std::string clip_text;                        ///< Clipboard content
     CursorShape pointer_shape =
         Ui::CursorShape::Default; ///< Current mouse pointer shape
     InputMouse::mouse_btn_t mouse_buttons =

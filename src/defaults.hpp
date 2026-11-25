@@ -93,6 +93,7 @@ namespace viewer {
 
     constexpr std::array text_scheme_tl = {
         "File:\t{name}",
+        "Path:\t{shortpath}",
         "Format:\t{format}",
         "File size:\t{sizehr}",
         "File time:\t{time}",
@@ -139,7 +140,8 @@ namespace gallery {
     constexpr bool pstore_enable = false;
     constexpr double pinch_factor = 1.0;
     constexpr argb_t mark_color = { argb_t::max, 0x80, 0x80, 0x80 };
-    constexpr std::array text_scheme_tl = { "File:\t{name}" };
+    constexpr std::array text_scheme_tl = { "File:\t{name}",
+                                            "Path:\t{shortpath}" };
     constexpr std::array text_scheme_tr = { "{list.index} of {list.total}" };
 
     /** Set default input bindings. */

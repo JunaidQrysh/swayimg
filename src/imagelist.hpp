@@ -8,6 +8,7 @@
 
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -54,6 +55,16 @@ public:
      * @return list of added entries in source order
      */
     EntriesArray add(const std::vector<std::filesystem::path>& sources);
+
+    /**
+     * Add entry without checking or expanding the path (e.g. a directory
+     * shown as an empty album).
+     * @param path entry path
+     * @param mtime modification time used for sorting
+     * @return added entry, nullptr if already exists
+     */
+    ImageEntryPtr add_placeholder(const std::filesystem::path& path,
+                                  const std::time_t mtime);
 
     /**
      * Remove all given paths from the list.
@@ -232,6 +243,8 @@ private:
 
 public:
     bool recursive; ///< Read directories recursively
+    /** Filter for files found in directories (nullptr: accept all). */
+    std::function<bool(const std::filesystem::path&)> file_filter;
     bool adjacent;  ///< Open adjacent files from the same directory
     bool fsmon;     ///< FS monitor usage
 };

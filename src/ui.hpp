@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <string>
+
 #include "canvas.hpp"
 
 class Ui {
@@ -104,6 +106,13 @@ public:
      * @return mouse pointer coordinates
      */
     virtual Point get_mouse() { return {}; }
+
+    /**
+     * Put text to the system clipboard.
+     * @param text text to copy
+     * @return false if not supported
+     */
+    virtual bool set_clipboard(const std::string& /*text*/) { return false; }
 
     /**
      * Begin window redraw procedure.

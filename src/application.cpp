@@ -10,6 +10,7 @@
 #include "fsmonitor.hpp"
 #include "gallery.hpp"
 #include "imagelist.hpp"
+#include "library.hpp"
 #include "log.hpp"
 #include "luaengine.hpp"
 #include "slideshow.hpp"
@@ -82,10 +83,38 @@ int Application::run()
         lua_engine.execute(sparams->lua_exec);
     }
 
+    // choose library view (Photos/Album) from startup sources
+    Library& library = Library::self();
+    library.startup(*sparams);
+    if (library.get_view() != Library::View::None) {
+        // list only photos and videos: other files would be dropped one by
+        // one when their thumbnails fail to load
+        ImageList::self().file_filter = [](const std::filesystem::path& p) {
+            return Library::self().accepts(p);
+        };
+    }
+
     // initialize filemon and image list
     FsMonitor::self().initialize();
-    const ImageEntryPtr first_entry = il_initialize();
-    if (!first_entry && active_mode != AppMode::Gallery) {
+    ImageEntryPtr first_entry = nullptr;
+    if (library.get_view() == Library::View::Photos) {
+        library.fill_photos(ImageList::self());
+        first_entry = ImageList::self().get(nullptr, ImageList::Dir::First);
+    } else if (!sparams->sources.empty()) {
+        ImageList& il = ImageList::self();
+        const bool adjacent = il.adjacent;
+        const bool recursive = il.recursive;
+        if (library.startup_adjacent()) {
+            il.adjacent = true; // album opened from a file
+        }
+        if (library.get_view() == Library::View::Album) {
+            il.recursive = library.album_recursive(library.get_album());
+        }
+        first_entry = il_initialize();
+        il.adjacent = adjacent;
+        il.recursive = recursive;
+    }
+    if (!first_entry && sparams->mode.get() != AppMode::Gallery) {
         Log::warning("Image list is empty, exit");
         return 1;
     }
@@ -113,7 +142,9 @@ int Application::run()
     app_id = sparams->app_id;
     sparams.reset();
 
+    library.update_margins();
     current_mode()->activate(first_entry, ui->get_window_size());
+    library.start_validation();
     if (active_mode != AppMode::Gallery && !current_mode()->get_current()) {
         Log::warning("Failed to open any images, exit");
         return 1;
@@ -152,6 +183,12 @@ void Application::set_mode(const AppMode::Type mode)
 
         app_mode = current_mode();
         const ImageEntryPtr entry = app_mode->get_current();
+
+        // albums grid: open album instead of showing its cover
+        if (active_mode == AppMode::Gallery &&
+            Library::self().activate_entry(entry)) {
+            return;
+        }
 
         // open videos from gallery in external player instead of viewer
         if (active_mode == AppMode::Gallery && mode == AppMode::Viewer &&
@@ -246,6 +283,42 @@ void Application::remove_all_images()
                                          entries);
         redraw();
     }
+}
+
+void Application::replace_images(
+    const std::function<void(ImageList&)>& load,
+    const std::filesystem::path& select)
+{
+    if (!initialized()) {
+        return;
+    }
+
+    transition.active = false;
+    current_mode()->deactivate();
+
+    ImageList& il = ImageList::self();
+    for (const ImageEntryPtr& entry : il.clear()) {
+        entry->removed = true; // keep caches from using stale entries
+    }
+    Gallery& gallery = Gallery::self();
+    gallery.drop_cache();
+
+    {
+        const Log::PerfTimer timer;
+        load(il);
+        if (Log::verbose_enable()) {
+            Log::verbose("Image list loaded in {:.6f} sec", timer.time());
+        }
+    }
+
+    ImageEntryPtr first = select.empty() ? nullptr : il.find(select);
+    if (!first) {
+        first = il.get(nullptr, ImageList::Dir::First);
+    }
+
+    active_mode = AppMode::Gallery;
+    gallery.activate(first, ui->get_window_size());
+    redraw();
 }
 
 void Application::add_fdpoll(const int fd, const FdEventHandler& handler)
@@ -484,6 +557,9 @@ void Application::handle_event(const AppEvent::Holder& event)
             } else if constexpr (std::is_same_v<decltype(event),
                                                 const AppEvent::FileRemove&>) {
                 handle_event(event);
+            } else if constexpr (std::is_same_v<decltype(event),
+                                                const AppEvent::Callback&>) {
+                handle_event(event);
             } else {
                 assert(false && "unhnadled event type");
                 handle_event(event);
@@ -534,6 +610,8 @@ void Application::handle_event(const AppEvent::WindowRedraw&)
         }
         last_frame = now;
         animating = mode->animate(dt);
+        Library& library = Library::self();
+        animating |= library.animate(dt);
 
         if (transition.active) {
             // gallery in the back, fading viewer layer, image on top
@@ -550,6 +628,9 @@ void Application::handle_event(const AppEvent::WindowRedraw&)
             viewer.window_redraw(*canvas);
             canvas->end_layer(transition.opening ? e : 1.0 - e);
             viewer.draw_photo(*canvas);
+            if (!transition.opening) {
+                library.draw(*canvas, e); // fade in with the gallery
+            }
             if (transition.t >= 1.0) {
                 transition.active = false;
                 if (!transition.opening) {
@@ -560,8 +641,13 @@ void Application::handle_event(const AppEvent::WindowRedraw&)
             }
         } else {
             mode->window_redraw(*canvas);
+            if (active_mode == AppMode::Gallery) {
+                library.draw(*canvas, 1.0);
+            }
         }
         Text::self().draw(*canvas);
+        library.draw_toast(*canvas, active_mode == AppMode::Gallery &&
+                                        !transition.active);
         ui->commit_surface();
 
         if (on_redraw_complete) {
@@ -587,6 +673,10 @@ void Application::handle_event(const AppEvent::WindowRedraw&)
 
 void Application::handle_event(const AppEvent::KeyPress& event)
 {
+    if (active_mode == AppMode::Gallery && !transition.active &&
+        Library::self().handle_key(event.key)) {
+        return;
+    }
     current_mode()->handle_keyboard(event.key);
 }
 
@@ -599,6 +689,11 @@ void Application::handle_event(const AppEvent::Scroll& event)
 void Application::handle_event(const AppEvent::MouseClick& event)
 {
     AppMode* mode = current_mode();
+    if (active_mode == AppMode::Gallery && !transition.active &&
+        Library::self().handle_mbutton(event.button, event.pressed,
+                                       event.pointer)) {
+        return; // consumed by library overlay (mode switcher, header)
+    }
     if (mode->handle_mbutton(event.button, event.pressed, event.pointer)) {
         return; // consumed by the mode (e.g. embedded video controls)
     }
@@ -651,7 +746,11 @@ void Application::handle_event(const AppEvent::FileCreate& event)
     // exceptions in the main loop. An error means "not a directory", the
     // image list skips such a path on its own.
     std::error_code ec;
-    if (!std::filesystem::is_directory(event.path, ec) || il.recursive) {
+    const bool is_dir = std::filesystem::is_directory(event.path, ec);
+    if (!is_dir && il.file_filter && !il.file_filter(event.path)) {
+        return; // not a media file
+    }
+    if (!is_dir || il.recursive) {
         // Temporarily disable `adjacent` to prevent adding unnecessary files.
         const bool adjacent = il.adjacent;
         il.adjacent = false;
@@ -680,7 +779,16 @@ void Application::handle_event(const AppEvent::FileRemove& event)
     // ignore directories, files will be removed as standalone event
     std::error_code ec;
     if (!std::filesystem::is_directory(event.path, ec)) {
+        Log::verbose("File removed from the list: {}", event.path.string());
         remove_images({ event.path });
+    }
+}
+
+// NOLINTNEXTLINE(readability-convert-member-functions-to-static)
+void Application::handle_event(const AppEvent::Callback& event)
+{
+    if (event.fn) {
+        event.fn();
     }
 }
 

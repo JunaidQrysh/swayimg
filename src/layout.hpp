@@ -66,6 +66,38 @@ public:
     void set_padding(const size_t padding);
 
     /**
+     * Set content insets: areas at the top and bottom of the window
+     * covered by overlays (header, floating controls). Thumbnails scroll
+     * under them, but the scroll range and selection keep clear of them.
+     * @param top,bottom inset sizes in pixels
+     */
+    void set_margins(const size_t top, const size_t bottom);
+
+    /** Scroll to the top without animation. */
+    void reset_scroll();
+
+    /**
+     * Set scroll offset immediately (scroll bar dragging).
+     * @param offset scroll offset in pixels
+     */
+    void set_scroll(const double offset);
+
+    /** Get current scroll offset in pixels. */
+    [[nodiscard]] double get_scroll() const { return scroll; }
+
+    /** Get max scroll offset in pixels (0 if everything fits). */
+    [[nodiscard]] double get_max_scroll() const { return max_scroll(); }
+
+    /** Get height of the scrollable viewport (window without insets). */
+    [[nodiscard]] double get_view_height() const { return view_height(); }
+
+    /** Get top inset. */
+    [[nodiscard]] size_t get_margin_top() const { return margin_top; }
+
+    /** Get bottom inset. */
+    [[nodiscard]] size_t get_margin_bottom() const { return margin_bottom; }
+
+    /**
      * Get number of columns.
      * @return number of thumbnail columns
      */
@@ -190,6 +222,9 @@ private:
     /** Get max scroll offset. */
     [[nodiscard]] double max_scroll() const;
 
+    /** Get height of the window area not covered by insets. */
+    [[nodiscard]] double view_height() const;
+
     /** Get top coordinate of the row in grid space. */
     [[nodiscard]] double row_top(const size_t row) const;
 
@@ -208,6 +243,8 @@ private:
 private:
     size_t thumb_size;             ///< Size of thumbnail in pixels
     size_t thumb_padding;          ///< Padding between thumbnails in pixels
+    size_t margin_top = 0;         ///< Top inset (overlay header)
+    size_t margin_bottom = 0;      ///< Bottom inset (floating controls)
     std::vector<Thumbnail> scheme; ///< Layout scheme of visible thumbnails
 
     Size window;          ///< Layout size (output window)
