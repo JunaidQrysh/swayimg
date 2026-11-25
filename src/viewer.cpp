@@ -13,6 +13,7 @@
 #include "text.hpp"
 #include "embeddedvideo.hpp"
 #include "fdothumb.hpp"
+#include "lazylib.hpp"
 #include "videoplayer.hpp"
 #include "buildconf.hpp"
 #ifdef HAVE_HWDECODE
@@ -1123,14 +1124,26 @@ void Viewer::stop_video()
 
 void Viewer::prewarm_video()
 {
-#ifdef HAVE_HWDECODE
-    // open GPU decoder device in background, it takes tens of milliseconds
-    loader.add([] {
+    // load libraries and open GPU decoder device in background, it takes
+    // tens of milliseconds; the player itself needs GL context of the main
+    // thread, so it is prepared there once libmpv is loaded
+    loader.add([this] {
         lower_thread_priority();
+#ifdef HAVE_HWDECODE
         HwDecode::warmup();
-    });
 #endif
+#ifdef HAVE_LIBMPV
+        if (Lazy::mpv()) {
+            Application::self().add_event(AppEvent::Callback { [this] {
+                prepare_video();
+            } });
+        }
+#endif
+    });
+}
 
+void Viewer::prepare_video()
+{
     if (!video && EmbeddedVideo::available()) {
         video = std::make_unique<EmbeddedVideo>();
         if (!video->prepare()) {

@@ -3,6 +3,7 @@
 // Copyright (C) 2026 Artem Senichev <artemsen@gmail.com>
 
 #include "../imageformat.hpp"
+#include "../lazylib.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -27,7 +28,7 @@ public:
     ImageFormatVideo() noexcept
         : ImageFormat(Priority::Lowest, "video")
     {
-        av_log_set_level(AV_LOG_QUIET); // keep quiet
+        // FFmpeg is loaded on first use (see lazylib.hpp), not on startup
     }
 
     [[nodiscard]] ImagePtr decode(const Data& data) const override
@@ -108,6 +109,17 @@ private:
      */
     static bool is_video(const Data& data)
     {
+        static const bool ffmpeg_ready = [] {
+            if (!Lazy::ffmpeg()) {
+                return false;
+            }
+            av_log_set_level(AV_LOG_QUIET); // keep quiet
+            return true;
+        }();
+        if (!ffmpeg_ready) {
+            return false;
+        }
+
         constexpr size_t probe_size = 4096;
 
         const size_t size = std::min(data.size, probe_size);

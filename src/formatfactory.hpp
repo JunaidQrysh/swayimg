@@ -26,9 +26,12 @@ public:
     /**
      * Load image.
      * @param entry image entry to load
+     * @param exif read EXIF metadata (slow, not needed for thumbnails
+     *        from cache: they have no EXIF, only PNG text fields)
      * @return image instance or nullptr if image wasn't loaded
      */
-    [[nodiscard]] ImagePtr load(const ImageEntryPtr& entry) const;
+    [[nodiscard]] ImagePtr load(const ImageEntryPtr& entry,
+                                const bool exif = true) const;
 
     /**
      * Save image in PNG format.
@@ -44,9 +47,11 @@ public:
     /**
      * Decode raw image data.
      * @param data source data to decode
+     * @param exif read EXIF metadata
      * @return image instance or nullptr on errors
      */
-    [[nodiscard]] ImagePtr decode(const ImageFormat::Data& data) const;
+    [[nodiscard]] ImagePtr decode(const ImageFormat::Data& data,
+                                  const bool exif = true) const;
 
     /**
      * Get preview (thumbnail).

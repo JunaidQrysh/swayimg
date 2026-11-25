@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <format>
+#include <thread>
 #include <utility>
 
 // Limits for thumbnail size and other parameters
@@ -32,8 +33,17 @@ constexpr size_t PADDING_SIZE_MAX = 1000;
 constexpr size_t BORDER_SIZE_MAX = 100;
 constexpr double SSCALE_MAX = 10.0;
 
-// Number of threads used for loading thumbnails
-constexpr size_t THUMB_LOAD_THREADS = 4;
+/**
+ * Get number of threads used for loading thumbnails: a screen of thumbnails
+ * is decoded in parallel, one CPU is left for the main (rendering) thread.
+ * @return number of threads
+ */
+static size_t thumb_load_threads()
+{
+    constexpr size_t min_threads = 4;
+    const size_t cpus = std::thread::hardware_concurrency();
+    return std::max(min_threads, cpus > 1 ? cpus - 1 : 1);
+}
 
 // Max time to wait for visible thumbnails before the first frame
 constexpr std::chrono::milliseconds WARMUP_TIMEOUT(150);
@@ -89,7 +99,7 @@ Gallery::Gallery()
     , clr_select(Defaults::gallery::clr_select)
     , clr_border(Defaults::gallery::clr_border)
     , hover_select(Defaults::gallery::hover_select)
-    , tpool(THUMB_LOAD_THREADS)
+    , tpool(thumb_load_threads())
     , pstore_enable(Defaults::gallery::pstore_enable)
     , pstore_path(Defaults::gallery::pstore_path())
     , preload(Defaults::gallery::preload)
@@ -641,7 +651,8 @@ bool Gallery::ready_to_draw()
 
     bool ready = std::chrono::steady_clock::now() >= warmup_end;
     if (!ready) {
-        ready = true;
+        // list is loading in background: wait for the first entries
+        ready = !layout.get_scheme().empty() || !ImageList::self().scanning();
         const std::scoped_lock lock(mutex);
         for (const auto& it : layout.get_scheme()) {
             if (!thumbs.contains(it.img)) {
@@ -1087,7 +1098,8 @@ Pixmap Gallery::pstore_load(const ImageEntryPtr& entry) const
     // load thumbnail
     const ImageEntryPtr thumb_entry = std::make_shared<ImageEntry>();
     thumb_entry->path = thumb_path;
-    const ImagePtr thumb_image = FormatFactory::self().load(thumb_entry);
+    // own thumbnails keep their info in PNG text fields, no EXIF
+    const ImagePtr thumb_image = FormatFactory::self().load(thumb_entry, false);
     if (!thumb_image) {
         return {};
     }

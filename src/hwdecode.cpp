@@ -3,6 +3,7 @@
 
 #include "hwdecode.hpp"
 
+#include "lazylib.hpp"
 #include "log.hpp"
 
 extern "C" {
@@ -48,13 +49,21 @@ AVBufferRef* device()
         AVBufferRef* ref = nullptr;
         Device()
         {
+            if (!Lazy::ffmpeg()) {
+                return; // FFmpeg is not available
+            }
             if (av_hwdevice_ctx_create(&ref, AV_HWDEVICE_TYPE_VAAPI, nullptr,
                                        nullptr, 0) < 0) {
                 ref = nullptr;
                 Log::verbose("VAAPI is not available");
             }
         }
-        ~Device() { av_buffer_unref(&ref); }
+        ~Device()
+        {
+            if (ref) {
+                av_buffer_unref(&ref);
+            }
+        }
     };
     static Device dev; // thread safe initialization
     return dev.ref;
@@ -853,7 +862,12 @@ bool jpeg(const ImageFormat::Data& data, Pixmap& pm, const int orientation)
     // decoder is reused: it keeps GPU surfaces allocated between images
     struct Decoder {
         AVCodecContext* ctx = nullptr;
-        ~Decoder() { avcodec_free_context(&ctx); }
+        ~Decoder()
+        {
+            if (ctx) {
+                avcodec_free_context(&ctx);
+            }
+        }
     };
     thread_local Decoder dec;
     if (!dec.ctx) {

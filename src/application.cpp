@@ -7,6 +7,7 @@
 #include "buildconf.hpp"
 #include "defaults.hpp"
 #include "embeddedvideo.hpp"
+#include "font.hpp"
 #include "fsmonitor.hpp"
 #include "gallery.hpp"
 #include "imagelist.hpp"
@@ -30,6 +31,7 @@
 
 #include <poll.h>
 
+#include <algorithm>
 #include <csignal>
 
 
@@ -69,6 +71,19 @@ Application::Application()
 
 int Application::run()
 {
+    // initialize fonts in background while Lua and UI start: FontConfig
+    // takes ~100 ms to load its configuration
+    Font::preload({ Defaults::text::font, "sans-serif", "monospace" });
+
+    // background jobs must not outlive the app (e.g. on early exit)
+    struct JobsGuard {
+        ~JobsGuard()
+        {
+            ImageList::self().scan_stop();
+            Font::preload_wait();
+        }
+    } const jobs_guard;
+
     // initialize and load Lua
     lua_bind_root.init(nullptr);
     lua_bind_imglist.init(LuaImageListApi::NS);
@@ -97,22 +112,17 @@ int Application::run()
     // initialize filemon and image list
     FsMonitor::self().initialize();
     ImageEntryPtr first_entry = nullptr;
-    if (library.get_view() == Library::View::Photos) {
-        library.fill_photos(ImageList::self());
-        first_entry = ImageList::self().get(nullptr, ImageList::Dir::First);
+    if (library.get_view() == Library::View::Photos ||
+        library.get_view() == Library::View::Album) {
+        // directories are loaded in background while UI starts
+        std::vector<ImageList::ScanSource> dirs;
+        first_entry = library_initialize(dirs);
+        if (!dirs.empty()) {
+            start_scan(std::move(dirs), library.scan_filter(),
+                       library.cache_tag(), !first_entry);
+        }
     } else if (!sparams->sources.empty()) {
-        ImageList& il = ImageList::self();
-        const bool adjacent = il.adjacent;
-        const bool recursive = il.recursive;
-        if (library.startup_adjacent()) {
-            il.adjacent = true; // album opened from a file
-        }
-        if (library.get_view() == Library::View::Album) {
-            il.recursive = library.album_recursive(library.get_album());
-        }
         first_entry = il_initialize();
-        il.adjacent = adjacent;
-        il.recursive = recursive;
     }
     if (!first_entry && sparams->mode.get() != AppMode::Gallery) {
         Log::warning("Image list is empty, exit");
@@ -293,16 +303,9 @@ void Application::replace_images(
         return;
     }
 
-    transition.active = false;
-    current_mode()->deactivate();
+    clear_images();
 
     ImageList& il = ImageList::self();
-    for (const ImageEntryPtr& entry : il.clear()) {
-        entry->removed = true; // keep caches from using stale entries
-    }
-    Gallery& gallery = Gallery::self();
-    gallery.drop_cache();
-
     {
         const Log::PerfTimer timer;
         load(il);
@@ -316,8 +319,101 @@ void Application::replace_images(
         first = il.get(nullptr, ImageList::Dir::First);
     }
 
+    show_gallery(first);
+}
+
+void Application::scan_images(std::vector<ImageList::ScanSource> sources,
+                              ImageList::ScanFilter filter,
+                              std::string cache_tag)
+{
+    if (!initialized()) {
+        return;
+    }
+
+    clear_images();
+    start_scan(std::move(sources), std::move(filter), std::move(cache_tag),
+               true);
+    show_gallery(nullptr); // entries appear as they are loaded
+}
+
+void Application::clear_images()
+{
+    transition.active = false;
+    current_mode()->deactivate();
+
+    for (const ImageEntryPtr& entry : ImageList::self().clear()) {
+        entry->removed = true; // keep caches from using stale entries
+    }
+    Gallery::self().drop_cache();
+}
+
+void Application::show_gallery(const ImageEntryPtr& select)
+{
     active_mode = AppMode::Gallery;
-    gallery.activate(first, ui->get_window_size());
+    Gallery::self().activate(select, ui->get_window_size());
+    redraw();
+}
+
+void Application::start_scan(std::vector<ImageList::ScanSource> sources,
+                             ImageList::ScanFilter filter,
+                             std::string cache_tag, const bool follow)
+{
+    scan_follow = { .active = follow, .entry = nullptr };
+    scan_begin = std::chrono::steady_clock::now();
+
+    ImageList::self().scan_start(
+        std::move(sources), std::move(filter),
+        [](const ImageList::ScanBatchPtr& batch) {
+            Application::self().add_event(AppEvent::Callback { [batch] {
+                Application::self().apply_scan(*batch);
+            } });
+        },
+        std::move(cache_tag));
+}
+
+void Application::apply_scan(const ImageList::ScanBatch& batch)
+{
+    ImageList& il = ImageList::self();
+    AppMode* mode = current_mode();
+    const ImageEntryPtr current = mode->get_current();
+
+    ImageList::EntriesArray added;
+    ImageList::EntriesArray removed;
+    if (!il.scan_apply(batch, added, removed)) {
+        return; // batch of a stopped scan
+    }
+
+    if (!removed.empty()) {
+        mode->handle_imagelist(AppMode::ImageListEvent::Remove, removed);
+    }
+
+    if (!added.empty()) {
+        mode->handle_imagelist(AppMode::ImageListEvent::Create, added);
+
+        // keep the top of the list selected while it is loading, until the
+        // user selects something else
+        if (scan_follow.active && active_mode == AppMode::Gallery &&
+            !transition.active && current == scan_follow.entry) {
+            const ImageEntryPtr first = il.get(nullptr, ImageList::Dir::First);
+            if (first && first != mode->get_current()) {
+                mode->set_current(first);
+            }
+            scan_follow.entry = mode->get_current();
+        } else {
+            scan_follow.active = false;
+        }
+    }
+
+    if (batch.done) {
+        if (Log::verbose_enable()) {
+            const std::chrono::duration<double> elapsed =
+                std::chrono::steady_clock::now() - scan_begin;
+            Log::verbose("Image list loaded in {:.6f} sec", elapsed.count());
+        }
+        scan_follow = {};
+        Library::self().start_validation();
+    }
+
     redraw();
 }
 
@@ -374,6 +470,73 @@ ImageEntryPtr Application::il_initialize() const
     }
 
     return added.empty() ? nullptr : added.front();
+}
+
+ImageEntryPtr
+Application::library_initialize(std::vector<ImageList::ScanSource>& dirs) const
+{
+    const auto add_dir = [&dirs](const std::filesystem::path& path,
+                                 const bool recursive) {
+        if (std::ranges::none_of(dirs, [&path](const auto& it) {
+                return it.path == path;
+            })) {
+            dirs.push_back({ .path = path, .recursive = recursive });
+        }
+    };
+
+    Library& library = Library::self();
+    ImageList& il = ImageList::self();
+    ImageEntryPtr first = nullptr;
+
+    if (library.get_view() == Library::View::Photos) {
+        dirs = library.photo_sources();
+    } else {
+        // album: files given on the command line are opened right away,
+        // directories and folders of the files are loaded in background
+        const bool recursive = library.album_recursive(library.get_album());
+        std::vector<std::filesystem::path> files;
+        for (const auto& src : sparams->sources) {
+            std::error_code ec;
+            const std::filesystem::path path =
+                std::filesystem::absolute(src, ec).lexically_normal();
+            if (ec) {
+                Log::warning("Invalid path {}, skipped", src.string());
+            } else if (std::filesystem::is_directory(path, ec)) {
+                add_dir(path, recursive);
+            } else if (!std::filesystem::exists(path, ec)) {
+                Log::warning("File {} not found, skipped", path.string());
+            } else {
+                files.push_back(path);
+                add_dir(path.parent_path(), recursive);
+            }
+        }
+        if (!files.empty()) {
+            const bool adjacent = il.adjacent;
+            il.adjacent = false;
+            const ImageList::EntriesArray added = il.add(files);
+            il.adjacent = adjacent;
+            if (!added.empty()) {
+                first = added.front();
+            }
+        }
+    }
+
+    if (!first && !dirs.empty() && sparams->mode.get() != AppMode::Gallery) {
+        // viewer needs an image to start with: load the list now
+        const bool adjacent = il.adjacent;
+        const bool recursive = il.recursive;
+        il.adjacent = false;
+        for (const auto& it : dirs) {
+            il.recursive = it.recursive;
+            il.add({ it.path });
+        }
+        il.adjacent = adjacent;
+        il.recursive = recursive;
+        dirs.clear();
+        first = il.get(nullptr, ImageList::Dir::First);
+    }
+
+    return first;
 }
 
 Ui* Application::ui_init_wayland() const

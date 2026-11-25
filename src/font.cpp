@@ -9,7 +9,10 @@
 
 #include <fontconfig/fontconfig.h>
 
+#include <future>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 namespace {
 
@@ -243,7 +246,72 @@ Pixmap rasterize_glyph(FT_GlyphSlot glyph)
     return pm;
 }
 
+/**
+ * Font files resolved in background: initialization of FontConfig parses all
+ * its config files and caches, which takes ~100 ms.
+ */
+struct FontPreload {
+    std::future<void> job; ///< Background job
+    std::mutex mutex;      ///< Paths map guard
+    std::unordered_map<std::string, std::filesystem::path> paths; ///< Fonts
+
+    /** Wait for the background job. */
+    void wait()
+    {
+        if (job.valid()) {
+            job.wait();
+        }
+    }
+
+    /**
+     * Get preloaded font file.
+     * @param name font name
+     * @return path to the font file, empty if not preloaded
+     */
+    std::filesystem::path get(const std::string& name)
+    {
+        wait();
+        const std::scoped_lock lock(mutex);
+        const auto it = paths.find(name);
+        return it == paths.end() ? std::filesystem::path {} : it->second;
+    }
+
+    static FontPreload& self()
+    {
+        static FontPreload singleton;
+        return singleton;
+    }
+};
+
 } // anonymous namespace
+
+void Font::preload(const std::vector<std::string>& names)
+{
+    FontPreload& preload = FontPreload::self();
+    if (preload.job.valid()) {
+        return; // already started
+    }
+    preload.job = std::async(std::launch::async, [names] {
+        FontConfig& fc = FontConfig::self();
+        FreeType::self();
+        if (!fc) {
+            return;
+        }
+        FontPreload& preload = FontPreload::self();
+        for (const auto& name : names) {
+            std::filesystem::path path = fc.get_font_file(name.c_str());
+            if (!path.empty()) {
+                const std::scoped_lock lock(preload.mutex);
+                preload.paths.insert_or_assign(name, std::move(path));
+            }
+        }
+    });
+}
+
+void Font::preload_wait()
+{
+    FontPreload::self().wait();
+}
 
 Font::Font() noexcept
     : size(Defaults::text::size)
@@ -252,14 +320,15 @@ Font::Font() noexcept
 
 bool Font::load(const std::string& name)
 {
-    FontConfig& fc = FontConfig::self();
-    if (!fc) {
-        return false;
+    std::filesystem::path path = FontPreload::self().get(name);
+    if (path.empty()) {
+        // get font file via FontConfig
+        FontConfig& fc = FontConfig::self();
+        if (!fc) {
+            return false;
+        }
+        path = fc.get_font_file(name.c_str());
     }
-
-    // get font file via FontConfig
-    const FontConfig fcinit;
-    const std::filesystem::path path = fc.get_font_file(name.c_str());
     if (path.empty()) {
         Log::error("Unable to find font {}", name);
         return false;

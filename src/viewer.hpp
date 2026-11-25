@@ -328,8 +328,14 @@ public:
     /** Stop playback and free the player (before GL context is destroyed). */
     void release_video();
 
-    /** Initialize video player in advance (GL context must be current). */
+    /**
+     * Initialize video player in advance: libraries are loaded in
+     * background, then the player is prepared in the main thread.
+     */
     void prewarm_video();
+
+    /** Initialize video player (GL context must be current). */
+    void prepare_video();
 
     /** Stop background loading (before the application exits). */
     void stop_loading();

@@ -7,6 +7,7 @@
 #include "appevent.hpp"
 #include "appmode.hpp"
 #include "fdevent.hpp"
+#include "imagelist.hpp"
 #include "luabinding.hpp"
 #include "sparam.hpp"
 #include "ui.hpp"
@@ -19,7 +20,6 @@
 #include <mutex>
 #include <vector>
 
-class ImageList;
 
 class Application {
 public:
@@ -102,6 +102,16 @@ public:
                         const std::filesystem::path& select);
 
     /**
+     * Replace the whole image list with images from directories loaded in
+     * background and show it in gallery mode.
+     * @param sources directories to load
+     * @param filter file filter (called in background)
+     * @param cache_tag filter id for the list cache
+     */
+    void scan_images(std::vector<ImageList::ScanSource> sources,
+                     ImageList::ScanFilter filter, std::string cache_tag);
+
+    /**
      * Add file descriptor to monitor.
      * @param fd file descriptor to watch
      * @param handler callback
@@ -132,6 +142,40 @@ private:
      * @return first image entry to open, nullptr on errors
      */
     [[nodiscard]] ImageEntryPtr il_initialize() const;
+
+    /**
+     * Initialize image list for library views (Photos/Album).
+     * @param dirs directories to load in background
+     * @return first image entry to open, nullptr if none yet
+     */
+    [[nodiscard]] ImageEntryPtr
+    library_initialize(std::vector<ImageList::ScanSource>& dirs) const;
+
+    /**
+     * Start loading directories in background.
+     * @param sources directories to load
+     * @param filter file filter (called in background)
+     * @param cache_tag filter id for the list cache
+     * @param follow keep the first entry selected while loading
+     */
+    void start_scan(std::vector<ImageList::ScanSource> sources,
+                    ImageList::ScanFilter filter, std::string cache_tag,
+                    const bool follow);
+
+    /**
+     * Add batch of background loaded entries (main thread).
+     * @param batch batch to apply
+     */
+    void apply_scan(const ImageList::ScanBatch& batch);
+
+    /** Stop current mode and clear image list and gallery cache. */
+    void clear_images();
+
+    /**
+     * Activate gallery mode after the image list was replaced.
+     * @param select entry to select
+     */
+    void show_gallery(const ImageEntryPtr& select);
 
     /**
      * Initialize Wayland UI.
@@ -199,6 +243,13 @@ private:
     std::deque<AppEvent::Holder> event_queue; ///< Event queue
     std::mutex event_mutex;                   ///< Event queue mutex
     FdEvent event_notify;                     ///< Event queue notification
+
+    /** Selection follows the first entry while list is loading. */
+    struct ScanFollow {
+        bool active = false;  ///< Following is enabled
+        ImageEntryPtr entry;  ///< Last automatically selected entry
+    } scan_follow;
+    std::chrono::steady_clock::time_point scan_begin; ///< Scan start time
 
     bool animating = false; ///< Animation is in progress
     bool video_prewarmed = false; ///< Video player initialized

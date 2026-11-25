@@ -5,11 +5,16 @@
 #pragma once
 
 #include "image.hpp"
+#include "pathhash.hpp"
 
+#include <atomic>
 #include <ctime>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <shared_mutex>
+#include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -38,7 +43,37 @@ public:
     };
 
     using EntriesArray = std::vector<ImageEntryPtr>;
-    using EntriesMap = std::unordered_map<std::filesystem::path, ImageEntryPtr>;
+    /** Map of path to entry. Key is a view of the path string of the
+     * entry (`entry->path.native()`): copying std::filesystem::path is
+     * expensive (each component is a separate allocated object). */
+    using EntriesMap = std::unordered_map<std::string_view, ImageEntryPtr>;
+
+    /** Directory to load in background. */
+    struct ScanSource {
+        std::filesystem::path path; ///< Directory path
+        bool recursive;             ///< Load nested directories
+    };
+
+    /** Part of the image list loaded in background. */
+    struct ScanBatch {
+        uint64_t id = 0;     ///< Scan id
+        EntriesArray all;    ///< All entries found so far (sorted)
+        EntriesArray added;  ///< Entries found since the previous batch
+        EntriesArray removed; ///< Entries of vanished or changed files
+        /** Map of `added` entries (first batch only): built in background
+         * to save the main thread from inserting them one by one. */
+        std::shared_ptr<EntriesMap> index;
+        std::vector<std::filesystem::path> dirs; ///< New directories to watch
+        Order order = Order::None; ///< Order used for sorting
+        bool reverse = false;      ///< Reverse order used for sorting
+        bool done = false;         ///< Last batch of the scan
+    };
+    using ScanBatchPtr = std::shared_ptr<const ScanBatch>;
+    /** Filter for files found while scanning (called in background). */
+    using ScanFilter = std::function<bool(const std::filesystem::path&)>;
+    /** Batch handler (called in background), must pass batch to
+     * scan_apply() in the main thread. */
+    using ScanPost = std::function<void(const ScanBatchPtr&)>;
 
     /**
      * Get global instance of image list.
@@ -48,6 +83,50 @@ public:
 
     /** Constructor. */
     ImageList();
+
+    /** Destructor. */
+    ~ImageList();
+
+    ImageList(const ImageList&) = delete;
+    ImageList& operator=(const ImageList&) = delete;
+
+    /**
+     * Start loading directories in a background thread, the previous scan
+     * is stopped. Found entries are passed in batches to `post`.
+     * The result is cached: the next scan of the same sources posts the
+     * cached list first, then updates it with changes found on disk.
+     * Main thread only.
+     * @param sources directories to load
+     * @param filter filter for found files (nullptr: accept all)
+     * @param post batch handler
+     * @param cache_tag id of the filter used in the cache key, empty to
+     *        disable cache
+     */
+    void scan_start(std::vector<ScanSource> sources, ScanFilter filter,
+                    ScanPost post, std::string cache_tag);
+
+    /**
+     * Stop background loading, batches already posted are ignored.
+     * Main thread only.
+     */
+    void scan_stop();
+
+    /**
+     * Add entries of the background scan batch to the list.
+     * Main thread only.
+     * @param batch batch to apply
+     * @param added entries added to the list
+     * @param removed entries removed from the list
+     * @return false if batch belongs to stopped scan
+     */
+    bool scan_apply(const ScanBatch& batch, EntriesArray& added,
+                    EntriesArray& removed);
+
+    /**
+     * Check if background loading is in progress.
+     * @return true if not all entries are loaded yet
+     */
+    [[nodiscard]] bool scanning() const { return scan_active; }
 
     /**
      * Add all images in specified sources.
@@ -240,6 +319,15 @@ private:
 
     Order order;  ///< Image list order
     bool reverse; ///< Reverse order flag
+
+    // Background loading (main thread only)
+    std::thread scan_thread;                         ///< Scanner thread
+    std::shared_ptr<std::atomic<bool>> scan_cancel;  ///< Scan stop flag
+    uint64_t scan_id = 0;                            ///< Current scan id
+    bool scan_active = false;                        ///< Scan in progress
+    bool scan_watch = false;                         ///< Watch scanned dirs
+    /** Scanned entries replaced with existing ones (same path). */
+    std::unordered_map<const ImageEntry*, ImageEntryPtr> scan_alias;
 
 public:
     bool recursive; ///< Read directories recursively

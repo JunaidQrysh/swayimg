@@ -5,6 +5,7 @@
 
 #include "application.hpp"
 #include "buildconf.hpp"
+#include "lazylib.hpp"
 #include "log.hpp"
 
 #ifdef HAVE_LIBMPV
@@ -33,7 +34,7 @@ void* get_proc_address(void*, const char* name)
 bool EmbeddedVideo::available()
 {
     const Ui* ui = Application::get_ui();
-    return ui && ui->is_gpu();
+    return ui && ui->is_gpu() && Lazy::mpv();
 }
 
 EmbeddedVideo::~EmbeddedVideo()

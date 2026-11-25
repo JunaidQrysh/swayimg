@@ -8,11 +8,20 @@
 #include "fsmonitor.hpp"
 #include "log.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cassert>
+#include <charconv>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <format>
+#include <fstream>
 #include <mutex>
 #include <random>
 #include <string>
+#include <unordered_set>
 
 namespace {
 
@@ -139,6 +148,500 @@ bool compare_entries(const ImageEntry& l, const ImageEntry& r,
     return false;
 }
 
+/**
+ * Create image entry for the file.
+ * @param path absolute path to the file
+ * @return image entry or nullptr if file can't be used
+ */
+ImageEntryPtr create_entry(const std::filesystem::path& path)
+{
+    // Use non-throwing functions: the file can be removed or renamed at any
+    // moment (temporary files of a browser or an editor), and callers (file
+    // system event handlers) don't catch exceptions.
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec)) {
+        Log::warning("File {} is not a regular, skipped", path.string());
+        return nullptr;
+    }
+
+    const auto fs_time = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        Log::warning("File {} skipped: {}", path.string(), ec.message());
+        return nullptr;
+    }
+    const auto sys_time =
+        std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+            fs_time - std::filesystem::file_time_type::clock::now() +
+            std::chrono::system_clock::now());
+
+    const size_t size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        Log::warning("File {} skipped: {}", path.string(), ec.message());
+        return nullptr;
+    }
+
+    ImageEntryPtr entry = std::make_shared<ImageEntry>();
+    entry->path = path;
+    entry->mtime = std::chrono::system_clock::to_time_t(sys_time);
+    entry->size = size;
+    return entry;
+}
+
+/**
+ * Get path of the scan cache file.
+ * @param key cache key (sources and filter)
+ * @return path to the cache file, empty if no cache dir
+ */
+std::filesystem::path scan_cache_path(const std::string& key)
+{
+    std::filesystem::path dir;
+    const char* xdg = std::getenv("XDG_CACHE_HOME");
+    if (xdg && *xdg) {
+        dir = xdg;
+    } else {
+        const char* home = std::getenv("HOME");
+        if (!home || !*home) {
+            return {};
+        }
+        dir = std::filesystem::path(home) / ".cache";
+    }
+
+    // FNV-1a: stable between builds, unlike std::hash
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    for (const char ch : key) {
+        hash ^= static_cast<uint8_t>(ch);
+        hash *= 0x100000001b3ULL;
+    }
+
+    return dir / "swayimg" / "scan" / std::format("{:016x}", hash);
+}
+
+/**
+ * Background directory loader: walks directories and periodically posts
+ * batches with all entries found so far, sorted in the list order.
+ * The result is saved to a cache file: on the next scan of the same sources
+ * the cached list is posted first, then the scan only adds new files and
+ * removes the ones that vanished or changed.
+ * Entries are not changed after posting, the main thread owns them.
+ */
+class Scanner {
+public:
+    Scanner(const uint64_t id, std::vector<ImageList::ScanSource> sources,
+            ImageList::ScanFilter filter, ImageList::ScanPost post,
+            std::string cache_tag, const ImageList::Order order,
+            const bool reverse, std::shared_ptr<std::atomic<bool>> cancel)
+        : id(id)
+        , sources(std::move(sources))
+        , filter(std::move(filter))
+        , post(std::move(post))
+        , cache_tag(std::move(cache_tag))
+        , order(order)
+        , reverse(reverse)
+        , cancel(std::move(cancel))
+        , by_name(order == ImageList::Order::Alpha ||
+                  order == ImageList::Order::Numeric)
+        , sorted(order != ImageList::Order::None &&
+                 order != ImageList::Order::Random)
+    {
+    }
+
+    /** Load all sources. */
+    void run()
+    {
+        last_flush = std::chrono::steady_clock::now();
+
+        // absolute paths of sources, they also form the cache key
+        std::vector<ImageList::ScanSource> roots;
+        std::string key = cache_tag;
+        for (const auto& src : sources) {
+            std::error_code ec;
+            std::filesystem::path root =
+                std::filesystem::absolute(src.path, ec).lexically_normal();
+            if (ec) {
+                Log::warning("Invalid path {}, skipped", src.path.string());
+                continue;
+            }
+            key += '\n';
+            key += src.recursive ? 'r' : '-';
+            key += root.string();
+            roots.push_back({ .path = std::move(root),
+                              .recursive = src.recursive });
+        }
+
+        if (!cache_tag.empty()) {
+            cache_path = scan_cache_path(key);
+            if (!cache_path.empty() && load_cache()) {
+                flush(false, true); // show cached list right away
+            }
+        }
+
+        for (const auto& root : roots) {
+            scan_dir(root.path, root.recursive);
+            if (*cancel) {
+                return;
+            }
+        }
+
+        // cached files not found by the scan
+        for (auto& it : cached) {
+            removed.push_back(std::move(it.second));
+        }
+        if (!cached.empty()) {
+            dirty = true;
+            cached.clear();
+        }
+
+        if (order == ImageList::Order::Random && !cache_loaded) {
+            static thread_local std::mt19937 engine(std::random_device {}());
+            std::shuffle(all.begin(), all.end(), engine);
+        }
+        flush(true);
+
+        if (dirty && !cache_path.empty() && !*cancel) {
+            save_cache();
+        }
+    }
+
+private:
+    // first batch is sent early to show something as soon as possible
+    static constexpr std::chrono::milliseconds FIRST_BATCH { 30 };
+    static constexpr std::chrono::milliseconds NEXT_BATCH { 150 };
+
+    // cache file header
+    static constexpr const char* CACHE_MAGIC = "swayimg-scan-v1";
+
+    /** Entry comparator in the list order. */
+    bool less(const ImageEntryPtr& l, const ImageEntryPtr& r) const
+    {
+        return reverse ? compare_entries(*r, *l, order)
+                       : compare_entries(*l, *r, order);
+    }
+
+    /**
+     * Load list from the cache file.
+     * @return true if cache was loaded
+     */
+    bool load_cache()
+    {
+        std::ifstream file(cache_path, std::ios::binary);
+        if (!file.is_open()) {
+            return false;
+        }
+
+        // header: magic, order and reverse flag used for sorting
+        std::string line;
+        if (!std::getline(file, line)) {
+            return false;
+        }
+        int cache_order = -1;
+        int cache_reverse = -1;
+        {
+            const std::string magic = std::string(CACHE_MAGIC) + ' ';
+            if (!line.starts_with(magic) ||
+                std::sscanf(line.c_str() + magic.size(), "%d %d",
+                            &cache_order, &cache_reverse) != 2) {
+                return false;
+            }
+        }
+
+        // entries: "<mtime> <size> <path>"
+        while (std::getline(file, line)) {
+            if (*cancel) {
+                return false;
+            }
+            const char* begin = line.data();
+            const char* end = begin + line.size();
+            std::time_t mtime = 0;
+            size_t size = 0;
+            auto res = std::from_chars(begin, end, mtime);
+            if (res.ec != std::errc() || res.ptr == end || *res.ptr != ' ') {
+                continue;
+            }
+            res = std::from_chars(res.ptr + 1, end, size);
+            if (res.ec != std::errc() || res.ptr == end || *res.ptr != ' ') {
+                continue;
+            }
+            std::filesystem::path path(std::string(res.ptr + 1, end));
+            if (filter && !filter(path)) {
+                dirty = true; // e.g. file is known as broken now
+                continue;
+            }
+            ImageEntryPtr entry = std::make_shared<ImageEntry>();
+            entry->path = std::move(path);
+            entry->mtime = mtime;
+            entry->size = size;
+            if (cached.try_emplace(entry->path.native(), entry).second) {
+                all.push_back(std::move(entry));
+            }
+        }
+
+        // sort only if the list order was changed since the cache was saved
+        if (cache_order != static_cast<int>(order) ||
+            cache_reverse != static_cast<int>(reverse)) {
+            dirty = true;
+            if (sorted) {
+                std::ranges::sort(all, [this](const auto& l, const auto& r) {
+                    return less(l, r);
+                });
+            }
+        }
+        if (order == ImageList::Order::Random) {
+            static thread_local std::mt19937 engine(std::random_device {}());
+            std::shuffle(all.begin(), all.end(), engine);
+        }
+
+        cache_loaded = true;
+        unposted = all; // must be registered by the main thread
+        return !all.empty();
+    }
+
+    /** Save list to the cache file. */
+    void save_cache() const
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(cache_path.parent_path(), ec);
+        if (ec) {
+            return;
+        }
+
+        // unique temporary file: other instances may save the same cache
+        std::filesystem::path tmp = cache_path;
+        tmp += std::format(".{}.tmp", getpid());
+        {
+            std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+            if (!file.is_open()) {
+                return;
+            }
+            file << CACHE_MAGIC << ' ' << static_cast<int>(order) << ' '
+                 << static_cast<int>(reverse) << '\n';
+            for (const ImageEntryPtr& entry : all) {
+                const std::string& path = entry->path.native();
+                if (path.find('\n') == std::string::npos) {
+                    file << entry->mtime << ' ' << entry->size << ' ' << path
+                         << '\n';
+                }
+            }
+            if (!file) {
+                file.close();
+                std::filesystem::remove(tmp, ec);
+                return;
+            }
+        }
+        std::filesystem::rename(tmp, cache_path, ec);
+        if (ec) {
+            std::filesystem::remove(tmp, ec);
+        }
+    }
+
+    /**
+     * Load directory.
+     * @param dir absolute path to the directory
+     * @param recursive load nested directories
+     */
+    void scan_dir(const std::filesystem::path& dir, const bool recursive)
+    {
+        if (watch_dirs.insert(dir).second) {
+            dirs.push_back(dir);
+        }
+
+        // Handle errors per entry: a single entry that can't be checked (a
+        // symlink loop, a link to an unreadable directory, an I/O error) must
+        // not hide all the other files of the directory.
+        std::vector<std::filesystem::path> files;
+        std::vector<std::filesystem::path> subdirs;
+        std::error_code ec;
+        std::filesystem::directory_iterator it(dir, ec);
+        const std::filesystem::directory_iterator end;
+        while (!ec && it != end) {
+            if (*cancel) {
+                return;
+            }
+            std::filesystem::path child = it->path();
+            std::error_code child_ec;
+            if (std::filesystem::is_directory(child, child_ec)) {
+                if (recursive) {
+                    subdirs.push_back(std::move(child));
+                }
+            } else if (child_ec) {
+                Log::warning("File {} skipped: {}", child.string(),
+                             child_ec.message());
+            } else if (!filter || filter(child)) {
+                files.push_back(std::move(child));
+            }
+            it.increment(ec);
+        }
+
+        // For name orders walk the tree in the list order: new entries are
+        // appended to the end, already shown part of the list stays in place.
+        // Files of a directory precede files of its subdirectories.
+        if (by_name) {
+            const bool numeric = order == ImageList::Order::Numeric;
+            std::ranges::sort(subdirs, [this, numeric](const auto& l,
+                                                       const auto& r) {
+                const int cmp =
+                    compare_strings(l.filename(), r.filename(), numeric);
+                return reverse ? cmp > 0 : cmp < 0;
+            });
+        }
+        if (!(by_name && reverse)) {
+            add_files(files);
+        }
+        for (const auto& sub : subdirs) {
+            scan_dir(sub, recursive);
+            if (*cancel) {
+                return;
+            }
+        }
+        if (by_name && reverse) {
+            add_files(files);
+        }
+    }
+
+    /**
+     * Create entries for files.
+     * @param files absolute paths to the files
+     */
+    void add_files(const std::vector<std::filesystem::path>& files)
+    {
+        for (const auto& path : files) {
+            if (*cancel) {
+                return;
+            }
+            if (seen.contains(path.native())) {
+                continue; // same file from another source
+            }
+            ImageEntryPtr entry = create_entry(path);
+
+            // file from the cache: keep its entry if file wasn't changed
+            const auto it = cached.find(path.native());
+            if (it != cached.end()) {
+                ImageEntryPtr prev = std::move(it->second);
+                cached.erase(it);
+                if (entry && entry->mtime == prev->mtime &&
+                    entry->size == prev->size) {
+                    seen.insert(path.native());
+                    continue;
+                }
+                removed.push_back(std::move(prev));
+            }
+
+            if (entry) {
+                seen.insert(path.native());
+                pending.push_back(std::move(entry));
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_flush >= (posted ? NEXT_BATCH : FIRST_BATCH)) {
+                flush(false);
+            }
+        }
+    }
+
+    /**
+     * Apply pending changes and post batch to the main thread.
+     * @param done last batch flag
+     * @param force post batch even if nothing changed
+     */
+    void flush(const bool done, const bool force = false)
+    {
+        last_flush = std::chrono::steady_clock::now();
+        if (pending.empty() && removed.empty() && !done && !force) {
+            return;
+        }
+
+        if (!removed.empty()) {
+            std::unordered_set<const ImageEntry*> gone;
+            gone.reserve(removed.size());
+            for (const ImageEntryPtr& entry : removed) {
+                gone.insert(entry.get());
+            }
+            std::erase_if(all, [&gone](const ImageEntryPtr& entry) {
+                return gone.contains(entry.get());
+            });
+            dirty = true;
+        }
+
+        if (!pending.empty()) {
+            dirty = true;
+            const size_t mid = all.size();
+            if (!sorted) {
+                all.insert(all.end(), pending.begin(), pending.end());
+            } else {
+                std::ranges::sort(pending, [this](const auto& l,
+                                                  const auto& r) {
+                    return less(l, r);
+                });
+                all.insert(all.end(), pending.begin(), pending.end());
+                if (mid && less(all[mid], all[mid - 1])) {
+                    std::inplace_merge(all.begin(), all.begin() + mid,
+                                       all.end(),
+                                       [this](const auto& l, const auto& r) {
+                                           return less(l, r);
+                                       });
+                }
+            }
+        }
+
+        auto batch = std::make_shared<ImageList::ScanBatch>();
+        batch->id = id;
+        batch->all = all;
+        batch->added = std::move(pending);
+        if (!unposted.empty()) {
+            // cached entries are new to the main thread too
+            batch->added.insert(batch->added.end(), unposted.begin(),
+                                unposted.end());
+            unposted.clear();
+        }
+        batch->removed = std::move(removed);
+        if (!posted && !batch->added.empty()) {
+            // the first batch is usually the whole cached list
+            batch->index = std::make_shared<ImageList::EntriesMap>();
+            batch->index->reserve(batch->added.size());
+            for (const ImageEntryPtr& entry : batch->added) {
+                batch->index->emplace(entry->path.native(), entry);
+            }
+        }
+        batch->dirs = std::move(dirs);
+        batch->order = order;
+        batch->reverse = reverse;
+        batch->done = done;
+        pending.clear();
+        removed.clear();
+        dirs.clear();
+
+        if (!*cancel) {
+            post(batch);
+            posted = true;
+        }
+    }
+
+    const uint64_t id;
+    const std::vector<ImageList::ScanSource> sources;
+    const ImageList::ScanFilter filter;
+    const ImageList::ScanPost post;
+    const std::string cache_tag;
+    const ImageList::Order order;
+    const bool reverse;
+    const std::shared_ptr<std::atomic<bool>> cancel;
+    const bool by_name; ///< List is sorted by path
+    const bool sorted;  ///< List is sorted (not random or unordered)
+
+    ImageList::EntriesArray all;     ///< All found entries, sorted
+    ImageList::EntriesArray pending; ///< Entries found since last batch
+    ImageList::EntriesArray removed; ///< Entries removed since last batch
+    std::vector<std::filesystem::path> dirs; ///< Dirs found since last batch
+    std::unordered_set<std::string> seen; ///< Found files
+    PathSet watch_dirs; ///< Found dirs
+    std::chrono::steady_clock::time_point last_flush; ///< Last batch time
+    bool posted = false; ///< At least one batch was posted
+
+    std::filesystem::path cache_path; ///< Cache file (empty: no cache)
+    /** Cached entries not yet found by the scan. */
+    ImageList::EntriesMap cached;
+    ImageList::EntriesArray unposted; ///< Cached entries not yet posted
+    bool cache_loaded = false; ///< Cache file was loaded
+    bool dirty = false;        ///< List differs from the cache file
+};
+
 } // anonymous namespace
 
 ImageList& ImageList::self()
@@ -154,6 +657,152 @@ ImageList::ImageList()
     , adjacent(Defaults::imglist::adjacent)
     , fsmon(Defaults::imglist::fsmon)
 {
+}
+
+ImageList::~ImageList()
+{
+    scan_stop();
+}
+
+void ImageList::scan_start(std::vector<ScanSource> sources, ScanFilter filter,
+                           ScanPost post, std::string cache_tag)
+{
+    scan_stop();
+
+    scan_cancel = std::make_shared<std::atomic<bool>>(false);
+    scan_active = true;
+    scan_watch = fsmon;
+
+    scan_thread = std::thread(
+        [scanner = std::make_shared<Scanner>(
+             scan_id, std::move(sources), std::move(filter), std::move(post),
+             std::move(cache_tag), order, reverse, scan_cancel)] {
+            scanner->run();
+        });
+}
+
+void ImageList::scan_stop()
+{
+    if (scan_cancel) {
+        *scan_cancel = true;
+        scan_cancel.reset();
+    }
+    if (scan_thread.joinable()) {
+        scan_thread.join();
+    }
+    ++scan_id; // drop batches that are already in the queue
+    scan_active = false;
+    scan_alias.clear();
+}
+
+bool ImageList::scan_apply(const ScanBatch& batch, EntriesArray& added,
+                           EntriesArray& removed)
+{
+    added.clear();
+    removed.clear();
+    if (!scan_active || batch.id != scan_id) {
+        return false; // batch of stopped scan
+    }
+
+    const std::scoped_lock lock(mutex);
+
+    if (scan_watch) {
+        FsMonitor& fsmon = FsMonitor::self();
+        for (const auto& dir : batch.dirs) {
+            fsmon.add(dir);
+        }
+    }
+
+    // drop entries of files that vanished or changed since cached
+    for (const ImageEntryPtr& entry : batch.removed) {
+        const auto it = entries_map.find(entry->path.native());
+        if (it != entries_map.end() && it->second == entry) {
+            entries_map.erase(it);
+            removed.push_back(entry);
+        }
+        entry->removed = true;
+    }
+
+    // register new entries, paths that already exist in the list (e.g. file
+    // given on the command line) keep their current entries
+    if (batch.index && batch.index->size() == batch.added.size()) {
+        // map is prepared in background: merge current entries into it
+        EntriesMap& index = *batch.index;
+        for (const auto& [path, entry] : entries_map) {
+            const auto it = index.find(path);
+            if (it == index.end()) {
+                index.emplace(path, entry);
+            } else {
+                // key is a view of the scanned entry: replace it too
+                it->second->removed = true;
+                scan_alias.insert_or_assign(it->second.get(), entry);
+                index.erase(it);
+                index.emplace(entry->path.native(), entry);
+            }
+        }
+        entries_map.swap(index);
+        added.reserve(batch.added.size());
+        for (const ImageEntryPtr& entry : batch.added) {
+            if (!entry->removed) {
+                added.push_back(entry);
+            }
+        }
+    } else {
+        for (const ImageEntryPtr& entry : batch.added) {
+            const auto [it, inserted] =
+                entries_map.try_emplace(entry->path.native(), entry);
+            if (inserted) {
+                added.push_back(entry);
+            } else {
+                entry->removed = true;
+                scan_alias.insert_or_assign(entry.get(), it->second);
+            }
+        }
+    }
+
+    // build the new list from the sorted scan result, skipping entries
+    // removed while the scan was in progress
+    EntriesArray list;
+    list.reserve(batch.all.size());
+    for (const ImageEntryPtr& entry : batch.all) {
+        if (!entry->removed) {
+            list.push_back(entry);
+        } else {
+            const auto it = scan_alias.find(entry.get());
+            if (it != scan_alias.end() && !it->second->removed) {
+                list.push_back(it->second);
+            }
+        }
+    }
+
+    bool resort = batch.order != order || batch.reverse != reverse;
+    if (list.size() + removed.size() != entries_arr.size() + added.size()) {
+        // entries added from other sources during the scan
+        std::unordered_set<const ImageEntry*> known;
+        known.reserve(list.size());
+        for (const ImageEntryPtr& entry : list) {
+            known.insert(entry.get());
+        }
+        for (const ImageEntryPtr& entry : entries_arr) {
+            if (!known.contains(entry.get())) {
+                list.push_back(entry);
+            }
+        }
+        resort = true;
+    }
+
+    entries_arr = std::move(list);
+    if (resort) {
+        sort(entries_arr);
+    }
+    reindex();
+
+    if (batch.done) {
+        scan_active = false;
+        scan_alias.clear();
+    }
+
+    return true;
 }
 
 ImageList::EntriesArray
@@ -216,14 +865,14 @@ ImageList::remove(const std::vector<std::filesystem::path>& sources)
             // remove all child entries
             for (const ImageEntryPtr& entry : get_child(abs_path)) {
                 entry->removed = true;
-                entries_map.erase(entry->path);
+                entries_map.erase(entry->path.native());
                 entries_arr[entry->index] = nullptr;
                 removed.emplace_back(entry);
             }
             FsMonitor::self().remove(abs_path);
         } else {
             // remove single entry
-            const auto it = entries_map.find(abs_path);
+            const auto it = entries_map.find(abs_path.native());
             if (it != entries_map.end()) {
                 const ImageEntryPtr entry = it->second;
                 entry->removed = true;
@@ -261,7 +910,7 @@ void ImageList::remove(const ImageEntryPtr& entry)
         return;
     }
 
-    entries_map.erase(entry->path);
+    entries_map.erase(entry->path.native());
     entries_arr.erase(entries_arr.begin() + entry->index);
     reindex(entry->index);
 
@@ -271,6 +920,8 @@ void ImageList::remove(const ImageEntryPtr& entry)
 
 ImageList::EntriesArray ImageList::clear()
 {
+    scan_stop(); // otherwise next batch brings entries back
+
     const std::scoped_lock lock(mutex);
 
     EntriesArray removed = entries_arr;
@@ -574,33 +1225,8 @@ ImageEntryPtr ImageList::add_file(const std::filesystem::path& path)
 {
     assert(path.is_absolute());
 
-    // Use non-throwing functions: the file can be removed or renamed at any
-    // moment (temporary files of a browser or an editor), and callers (file
-    // system event handlers) don't catch exceptions.
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(path, ec)) {
-        Log::warning("File {} is not a regular, skipped", path.string());
-        return nullptr;
-    }
-
-    const auto fs_time = std::filesystem::last_write_time(path, ec);
-    if (ec) {
-        Log::warning("File {} skipped: {}", path.string(), ec.message());
-        return nullptr;
-    }
-    const auto sys_time =
-        std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-            fs_time - std::filesystem::file_time_type::clock::now() +
-            std::chrono::system_clock::now());
-    const std::time_t mtime = std::chrono::system_clock::to_time_t(sys_time);
-
-    const size_t size = std::filesystem::file_size(path, ec);
-    if (ec) {
-        Log::warning("File {} skipped: {}", path.string(), ec.message());
-        return nullptr;
-    }
-
-    return add_entry(path, mtime, size);
+    const ImageEntryPtr entry = create_entry(path);
+    return entry ? add_entry(path, entry->mtime, entry->size) : nullptr;
 }
 
 ImageEntryPtr ImageList::add_entry(const std::filesystem::path& path,
@@ -608,12 +1234,12 @@ ImageEntryPtr ImageList::add_entry(const std::filesystem::path& path,
 {
     ImageEntryPtr entry = nullptr;
 
-    if (!entries_map.contains(path)) {
+    if (!entries_map.contains(path.native())) {
         entry = std::make_shared<ImageEntry>();
         entry->path = path;
         entry->mtime = mtime;
         entry->size = size;
-        entries_map.insert({ entry->path, entry });
+        entries_map.insert({ entry->path.native(), entry });
         entries_arr.push_back(entry);
     }
 

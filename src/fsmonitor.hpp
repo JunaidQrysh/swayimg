@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "pathhash.hpp"
+
 #include <filesystem>
 #include <unordered_map>
 
@@ -53,5 +55,5 @@ private:
     int fd = -1; ///< inotify file descriptor
 
     std::unordered_map<int, std::filesystem::path> fds;   ///< FD to path map
-    std::unordered_map<std::filesystem::path, int> paths; ///< Path to FD map
+    PathMap<int> paths; ///< Path to FD map
 };

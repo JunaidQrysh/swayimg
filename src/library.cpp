@@ -353,7 +353,7 @@ void Library::startup(StartupParams& params)
     std::vector<std::filesystem::path>& sources = params.sources;
 
     if (sources.empty()) {
-        // started without arguments: Photos view (see fill_photos)
+        // started without arguments: Photos view (see photo_sources)
         view = View::Photos;
         if (!params.mode.is_locked()) {
             params.mode = AppMode::Gallery;
@@ -385,17 +385,45 @@ void Library::startup(StartupParams& params)
     }
 }
 
-void Library::fill_photos(ImageList& il) const
+std::vector<ImageList::ScanSource> Library::photo_sources() const
 {
-    const bool recursive = il.recursive;
+    std::vector<ImageList::ScanSource> sources;
     for (const Album& it : albums) {
         std::error_code ec;
         if (it.in_photos && std::filesystem::is_directory(it.path, ec)) {
-            il.recursive = it.recursive;
-            il.add({ it.path });
+            sources.push_back({ .path = it.path, .recursive = it.recursive });
         }
     }
-    il.recursive = recursive;
+    return sources;
+}
+
+ImageList::ScanFilter Library::scan_filter() const
+{
+    // runs in a background thread: work with a copy of the current state
+    return [bad = bad_files,
+            type = filter](const std::filesystem::path& path) {
+        if (!is_media(path)) {
+            return false;
+        }
+        const auto it = bad.find(path);
+        if (it != bad.end() && it->second == file_stamp(path)) {
+            return false; // known broken file, not changed since
+        }
+        return filter_accepts(type, path);
+    };
+}
+
+std::string Library::cache_tag() const
+{
+    switch (filter) {
+        case Filter::All:
+            break;
+        case Filter::Photos:
+            return "photos";
+        case Filter::Videos:
+            return "videos";
+    }
+    return "all";
 }
 
 bool Library::album_recursive(const std::filesystem::path& dir) const
@@ -430,10 +458,13 @@ void Library::set_recursive(const std::filesystem::path& dir,
 
 bool Library::accepts(const std::filesystem::path& path) const
 {
-    if (!is_media(path) || is_bad(path)) {
-        return false;
-    }
-    switch (filter) {
+    return is_media(path) && !is_bad(path) && filter_accepts(filter, path);
+}
+
+bool Library::filter_accepts(const Filter type,
+                             const std::filesystem::path& path)
+{
+    switch (type) {
         case Filter::All:
             return true;
         case Filter::Photos:
@@ -459,12 +490,7 @@ void Library::set_filter(const Filter new_filter)
 
 void Library::show_photos()
 {
-    set_view(
-        View::Photos,
-        [this](ImageList& il) {
-            fill_photos(il);
-        },
-        {}, ImageList::self().fsmon);
+    set_view(View::Photos, photo_sources(), ImageList::self().fsmon);
 }
 
 void Library::show_albums(const std::filesystem::path& select)
@@ -572,16 +598,9 @@ void Library::open_album(const std::filesystem::path& dir)
         temp_recursive = false;
     }
     album = path;
-    const bool recursive = album_recursive(album);
-    set_view(
-        View::Album,
-        [path, recursive](ImageList& il) {
-            const bool prev = il.recursive;
-            il.recursive = recursive;
-            il.add({ path });
-            il.recursive = prev;
-        },
-        {}, ImageList::self().fsmon);
+    set_view(View::Album,
+             { { .path = path, .recursive = album_recursive(album) } },
+             ImageList::self().fsmon);
 }
 
 void Library::back()
@@ -718,6 +737,39 @@ void Library::set_view(const View new_view,
                        const std::function<void(ImageList&)>& load,
                        const std::filesystem::path& select, const bool watch)
 {
+    prepare_view(new_view);
+
+    // replace image list (directories only, adjacent files not needed)
+    ImageList& il = ImageList::self();
+    const bool adjacent = il.adjacent;
+    const bool fsmon = il.fsmon;
+    il.adjacent = false;
+    il.fsmon = watch;
+    Application::self().replace_images(load, select);
+    il.adjacent = adjacent;
+    il.fsmon = fsmon;
+
+    start_validation();
+}
+
+void Library::set_view(const View new_view,
+                       std::vector<ImageList::ScanSource> sources,
+                       const bool watch)
+{
+    prepare_view(new_view);
+
+    ImageList& il = ImageList::self();
+    const bool fsmon = il.fsmon;
+    il.fsmon = watch; // applied to the whole scan
+    Application::self().scan_images(std::move(sources), scan_filter(),
+                                    cache_tag());
+    il.fsmon = fsmon;
+
+    start_validation(); // stop checking the previous list, restarted on load
+}
+
+void Library::prepare_view(const View new_view)
+{
     view = new_view;
 
     Gallery& gallery = Gallery::self();
@@ -731,18 +783,6 @@ void Library::set_view(const View new_view,
     }
 
     update_margins();
-
-    // replace image list (directories only, adjacent files not needed)
-    ImageList& il = ImageList::self();
-    const bool adjacent = il.adjacent;
-    const bool fsmon = il.fsmon;
-    il.adjacent = false;
-    il.fsmon = watch;
-    Application::self().replace_images(load, select);
-    il.adjacent = adjacent;
-    il.fsmon = fsmon;
-
-    start_validation();
 }
 
 void Library::update_margins()
@@ -808,8 +848,8 @@ void Library::draw(Canvas& wnd, const double opacity)
         draw_albums_header(wnd, opacity);
     }
 
-    // hint for empty views
-    if (ImageList::self().size() == 0) {
+    // hint for empty views (not while the list is still loading)
+    if (ImageList::self().size() == 0 && !ImageList::self().scanning()) {
         std::string hint;
         if (filter != Filter::All && view != View::Albums) {
             hint = filter == Filter::Videos ? "No videos here"

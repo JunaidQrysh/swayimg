@@ -23,6 +23,16 @@ public:
     virtual ~Font() = default;
 
     /**
+     * Start initialization of font subsystem and search for font files in
+     * background, so the first text rendering doesn't wait for it.
+     * @param names font names to search for
+     */
+    static void preload(const std::vector<std::string>& names);
+
+    /** Wait for the background initialization started by preload(). */
+    static void preload_wait();
+
+    /**
      * Load font by name.
      * @param name font face name
      * @return false if font wasn't loaded

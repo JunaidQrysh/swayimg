@@ -106,7 +106,8 @@ if gpu_found and get_option('mpv').allowed()
     libmpv = dependency('mpv', required: get_option('mpv'))
     if libmpv.found()
         mpv_found = true
-        gpu_deps += libmpv
+        # headers only: library is loaded on demand (see src/lazylib.hpp)
+        gpu_deps += libmpv.partial_dependency(compile_args: true, includes: true)
     endif
 endif
 
@@ -157,8 +158,14 @@ avcodec = dependency('libavcodec', version: '>=60.31.102', required: get_option(
 avutil = dependency('libavutil', version: '>=58.29.100', required: get_option('video'))
 swscale = dependency('libswscale', version: '>=7.5.100', required: get_option('video'))
 if avformat.found() and avcodec.found() and avutil.found() and swscale.found()
+    # headers only: libraries are loaded on demand (see src/lazylib.hpp)
     video = declare_dependency(
-        dependencies: [avformat, avcodec, avutil, swscale],
+        dependencies: [
+            avformat.partial_dependency(compile_args: true, includes: true),
+            avcodec.partial_dependency(compile_args: true, includes: true),
+            avutil.partial_dependency(compile_args: true, includes: true),
+            swscale.partial_dependency(compile_args: true, includes: true),
+        ],
     )
 else
     video = dependency('', required: false)
@@ -365,6 +372,7 @@ sources = [
     'src/imagelist.cpp',
     'src/input.cpp',
     'src/layout.cpp',
+    'src/lazylib.cpp',
     'src/library.cpp',
     'src/luabinding.cpp',
     'src/luaengine.cpp',
@@ -446,7 +454,10 @@ if webp.found()
     sources += 'src/formats/webp.cpp'
 endif
 if video.found()
-    sources += 'src/formats/video.cpp'
+    sources += ['src/formats/video.cpp', 'src/lazy_ffmpeg.cpp']
+endif
+if mpv_found
+    sources += 'src/lazy_mpv.cpp'
 endif
 if hwdecode_found
     sources += 'src/hwdecode.cpp'
@@ -454,6 +465,7 @@ endif
 
 dependencies = [
     # runtime
+    dependency('dl'),
     drm,
     epoll,
     fontconfig,

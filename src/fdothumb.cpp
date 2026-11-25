@@ -229,7 +229,8 @@ Pixmap load_file(const std::filesystem::path& path, const struct stat& st,
 
     const ImageEntryPtr thumb_entry = std::make_shared<ImageEntry>();
     thumb_entry->path = thumb_path;
-    const ImagePtr thumb = FormatFactory::self().load(thumb_entry);
+    // freedesktop thumbnails keep their info in PNG text fields, no EXIF
+    const ImagePtr thumb = FormatFactory::self().load(thumb_entry, false);
     if (!thumb || thumb->frames.empty()) {
         return {};
     }

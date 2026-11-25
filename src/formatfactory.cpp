@@ -244,7 +244,7 @@ std::string FormatFactory::list() const
     return fmt;
 }
 
-ImagePtr FormatFactory::load(const ImageEntryPtr& entry) const
+ImagePtr FormatFactory::load(const ImageEntryPtr& entry, const bool exif) const
 {
     const Log::PerfTimer timer;
 
@@ -253,7 +253,7 @@ ImagePtr FormatFactory::load(const ImageEntryPtr& entry) const
         return nullptr;
     }
 
-    ImagePtr image = decode(data);
+    ImagePtr image = decode(data, exif);
     if (!image) {
         Log::verbose("Unsupported image format in {}", entry->path.string());
     } else {
@@ -323,7 +323,8 @@ bool FormatFactory::save(
     return true;
 }
 
-ImagePtr FormatFactory::decode(const ImageFormat::Data& data) const
+ImagePtr FormatFactory::decode(const ImageFormat::Data& data,
+                               const bool exif) const
 {
     for (const auto& it : formats) {
         if (!it->enable) {
@@ -335,7 +336,8 @@ ImagePtr FormatFactory::decode(const ImageFormat::Data& data) const
             continue;
         }
 
-        if (ImageFormat::read_metadata(data, image) && fix_orientation) {
+        if (exif && ImageFormat::read_metadata(data, image) &&
+            fix_orientation) {
             it->fix_orientation(image);
         }
 

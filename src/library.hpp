@@ -6,6 +6,8 @@
 #include "canvas.hpp"
 #include "fdevent.hpp"
 #include "image.hpp"
+#include "imagelist.hpp"
+#include "pathhash.hpp"
 #include "input.hpp"
 #include "sparam.hpp"
 
@@ -19,7 +21,6 @@
 #include <vector>
 
 class FontSet;
-class ImageList;
 
 /**
  * Photo library.
@@ -120,10 +121,23 @@ public:
     void show_photos();
 
     /**
-     * Fill image list with images of albums shown in Photos.
-     * @param il image list to fill
+     * Get directories of albums shown in Photos.
+     * @return directories to load
      */
-    void fill_photos(ImageList& il) const;
+    [[nodiscard]] std::vector<ImageList::ScanSource> photo_sources() const;
+
+    /**
+     * Get filter for loading files in background: same as accepts(), but
+     * works with a copy of the current state.
+     * @return file filter
+     */
+    [[nodiscard]] ImageList::ScanFilter scan_filter() const;
+
+    /**
+     * Get id of the current media type filter for the list cache.
+     * @return filter id
+     */
+    [[nodiscard]] std::string cache_tag() const;
 
     /**
      * Check if album includes nested folders.
@@ -291,6 +305,30 @@ private:
                   const std::function<void(ImageList&)>& load,
                   const std::filesystem::path& select, const bool watch);
 
+    /**
+     * Switch view and load directories into image list in background.
+     * @param new_view view to set
+     * @param sources directories to load
+     * @param watch use file system monitor
+     */
+    void set_view(const View new_view, std::vector<ImageList::ScanSource> sources,
+                  const bool watch);
+
+    /**
+     * Switch view: set view specific gallery settings.
+     * @param new_view view to set
+     */
+    void prepare_view(const View new_view);
+
+    /**
+     * Check if file of specified type must be listed.
+     * @param type media type filter
+     * @param path file path
+     * @return true if file is accepted
+     */
+    static bool filter_accepts(const Filter type,
+                               const std::filesystem::path& path);
+
     /** Load fonts and apply window scale. */
     void prepare_fonts();
 
@@ -362,12 +400,12 @@ private:
     View view = View::None;               ///< Current view
     bool adjacent_start = false;          ///< Load startup dir from a file
     bool temp_recursive = false; ///< Subfolders of unsaved album included
-    std::unordered_map<std::filesystem::path, std::pair<uintmax_t, int64_t>>
+    PathMap<std::pair<uintmax_t, int64_t>>
         bad_files;                         ///< Broken files: size, mtime
     std::atomic<uint64_t> validate_gen = 0; ///< Background check generation
-    std::unordered_map<std::filesystem::path, std::filesystem::path>
+    PathMap<std::filesystem::path>
         cover_album;                      ///< Cover image to album map
-    std::unordered_map<std::filesystem::path, AlbumInfo>
+    PathMap<AlbumInfo>
         album_info;                       ///< Albums scan results
 
     // UI
