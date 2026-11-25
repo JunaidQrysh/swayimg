@@ -49,6 +49,7 @@ private:
     EGLDisplay egl_display = EGL_NO_DISPLAY;
     EGLConfig egl_config = nullptr;
     EGLContext egl_context = EGL_NO_CONTEXT;
+    EGLContext upload_context = EGL_NO_CONTEXT; ///< Shared, for uploads
     EGLSurface egl_surface = EGL_NO_SURFACE;
     wl_egl_window* egl_window = nullptr;
     Size window_size;

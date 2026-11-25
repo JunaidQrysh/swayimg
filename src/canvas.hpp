@@ -6,6 +6,7 @@
 #include "pixmap.hpp"
 
 #include <functional>
+#include <memory>
 
 /**
  * Abstract drawing surface used for window redraw.
@@ -176,6 +177,25 @@ public:
      * Software implementation draws directly on the canvas.
      */
     virtual void begin_layer() {}
+
+    /**
+     * Prepare pixmap for drawing in small steps (e.g. upload to GPU) to
+     * avoid long frames when a large image is shown for the first time.
+     * @param pm pixmap to prepare
+     * @param owner object that owns the pixmap, kept alive while the pixmap
+     *              is processed in background
+     * @param budget max time to spend in this call (seconds)
+     * @param scale scale the pixmap will be drawn with: the pixmap is ready
+     *              when it can be drawn at this scale without quality loss,
+     *              full resolution may follow later
+     * @return true if the pixmap is ready to be drawn without delays
+     */
+    virtual bool preload(const Pixmap& /*pm*/,
+                         const std::shared_ptr<const void>& /*owner*/,
+                         const double /*budget*/, const double /*scale*/)
+    {
+        return true;
+    }
 
     /**
      * Finish layer and composite it onto the canvas.

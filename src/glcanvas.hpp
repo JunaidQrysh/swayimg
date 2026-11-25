@@ -7,7 +7,14 @@
 
 #include <GLES3/gl3.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -24,6 +31,15 @@ public:
      * @return false on error
      */
     bool initialize();
+
+    /**
+     * Enable uploading of large textures in a background thread.
+     * @param bind function to make a shared GL context current on the
+     *             calling thread
+     * @param unbind function to release the context
+     */
+    void enable_async_upload(const std::function<bool()>& bind,
+                             const std::function<void()>& unbind);
 
     /**
      * Begin frame.
@@ -64,6 +80,8 @@ public:
                       const double render_scale, const Point& pos,
                       const double scale, const Rectangle& clip) override;
     void begin_layer() override;
+    bool preload(const Pixmap& pm, const std::shared_ptr<const void>& owner,
+                 const double budget, const double scale) override;
     void end_layer(const double opacity) override;
 
 private:
@@ -79,6 +97,10 @@ private:
         size_t bytes = 0;        ///< Size in GPU memory
         uint64_t last_use = 0;   ///< Number of the frame where used last time
         bool mipmap = false;     ///< Mipmaps generated
+        bool pending = false;    ///< Upload is in progress (see preload)
+        bool reduced = false;    ///< Reduced resolution, full one follows
+        size_t up_tile = 0;      ///< Pending upload: current tile
+        size_t up_row = 0;       ///< Pending upload: next row in the tile
     };
 
     /** Shader program with uniform locations. */
@@ -115,7 +137,49 @@ private:
     static Program make_program(const char* fragment);
 
     const Texture& get_texture(const Pixmap& pm, const bool mipmap);
+    Texture create_texture(const Pixmap& pm, const bool upload) const;
+    static bool upload_rows(const Pixmap& pm, Texture& tex,
+                            const double budget);
     static void free_texture(Texture& tex);
+
+    /** Background upload job. */
+    struct UploadJob {
+        const Pixmap* pm;                  ///< Pixmap to upload
+        std::shared_ptr<const void> owner; ///< Owner of the pixmap
+        size_t level = 0;                  ///< Downscale level of first stage
+        Texture reduced;                   ///< First stage: reduced texture
+        GLsync reduced_fence = nullptr;    ///< First stage complete fence
+        bool reduced_done = false;         ///< First stage is finished
+        bool reduced_taken = false;        ///< First stage is in the cache
+        Texture tex;                       ///< Full resolution texture
+        GLsync fence = nullptr;            ///< Upload complete fence
+        bool done = false;                 ///< Job is finished
+    };
+
+    /**
+     * Upload texture in background thread (allocate, fill, mipmaps).
+     * @param pm pixmap to upload
+     * @return texture and fence of the upload
+     */
+    std::pair<Texture, GLsync> upload_async(const Pixmap& pm,
+                                            const bool urgent) const;
+
+    /** Time of the last frame (steady clock ticks), used to slow down
+     * non-urgent uploads while animation frames are drawn. */
+    std::atomic<int64_t> last_frame_time = 0;
+
+    void upload_worker();
+    bool collect_uploads(); ///< Take finished uploads, false if failed
+
+    std::thread up_thread;                        ///< Upload thread
+    std::mutex up_mutex;                          ///< Upload queue sync
+    std::condition_variable up_cv;                ///< Upload queue signal
+    std::deque<std::shared_ptr<UploadJob>> up_queue; ///< Waiting jobs
+    std::unordered_map<uint64_t, std::shared_ptr<UploadJob>> up_jobs; ///< Jobs
+    bool up_stop = false;                 ///< Stop upload thread
+    std::atomic<bool> up_failed = false;  ///< Upload context is unusable
+    std::function<bool()> up_bind;        ///< Bind upload context
+    std::function<void()> up_unbind;      ///< Unbind upload context
 
     void set_blend(const Blend mode);
     void use(const Program& prog, const Size& viewport);

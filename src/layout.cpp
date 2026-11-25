@@ -99,6 +99,38 @@ void Layout::select(const ImageEntryPtr& image)
     }
 }
 
+void Layout::select_keep_scroll(const ImageEntryPtr& image)
+{
+    sel_entry = image;
+    recalc();
+    if (!sel_entry || !total) {
+        return;
+    }
+    if (!window) {
+        center_selection(); // not shown yet
+        return;
+    }
+
+    const double top = row_top(selected_row()) - thumb_padding;
+    const double bottom = row_top(selected_row()) + thumb_size;
+    const double view = std::clamp(scroll, 0.0, max_scroll());
+    double new_scroll = view;
+    if (bottom <= view || top >= view + window.height) {
+        center_selection(); // out of view
+        return;
+    }
+    if (top < view) {
+        new_scroll = top; // partially visible: scroll as little as possible
+    } else if (bottom > view + window.height) {
+        new_scroll = bottom - window.height;
+    }
+
+    velocity = 0;
+    target = std::clamp(new_scroll, 0.0, max_scroll());
+    scroll = target;
+    rebuild();
+}
+
 bool Layout::select(const Direction dir)
 {
     assert(sel_entry);

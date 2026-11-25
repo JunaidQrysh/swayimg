@@ -14,11 +14,18 @@
 #include "embeddedvideo.hpp"
 #include "fdothumb.hpp"
 #include "videoplayer.hpp"
+#include "buildconf.hpp"
+#ifdef HAVE_HWDECODE
+#include "hwdecode.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
 #include <format>
 #include <utility>
+
+#include <sys/resource.h>
+#include <unistd.h>
 
 namespace {
 
@@ -48,6 +55,15 @@ double ease_out(const double t)
 
 /** Max scale factor. */
 constexpr double MAX_SCALE = 100.0;
+
+/**
+ * Lower CPU priority of the calling thread (and threads it creates), so
+ * background loading doesn't delay drawing of animation frames.
+ */
+static void lower_thread_priority()
+{
+    setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 10);
+}
 
 Viewer& Viewer::self()
 {
@@ -185,11 +201,14 @@ void Viewer::set_scale(const Scale sc)
     const double ratio_h =
         static_cast<double>(window_size.height) / pm.height();
 
-    double abs_sc = 1.0;
+    // 100% of the full image (placeholder thumbnail is smaller)
+    const double real = pixel_ratio();
+
+    double abs_sc = real;
     switch (sc) {
         case Scale::Keep:
         case Scale::Optimal:
-            abs_sc = std::min({ 1.0, ratio_w, ratio_h });
+            abs_sc = std::min({ real, ratio_w, ratio_h });
             break;
         case Scale::FitWindow:
             abs_sc = std::min(ratio_w, ratio_h);
@@ -204,7 +223,7 @@ void Viewer::set_scale(const Scale sc)
             abs_sc = std::max(ratio_w, ratio_h);
             break;
         case Scale::RealSize:
-            abs_sc = 1.0; // 100 %
+            abs_sc = real; // 100 %
             break;
     }
 
@@ -225,8 +244,8 @@ void Viewer::set_scale(const double sc, const Point& preserve)
     if (!scaled) {
         return;
     }
-    if (sc > MAX_SCALE) {
-        new_scale = MAX_SCALE;
+    if (sc > MAX_SCALE * pixel_ratio()) {
+        new_scale = MAX_SCALE * pixel_ratio();
     }
 
     // save base point of the image
@@ -446,6 +465,10 @@ void Viewer::bind_image_drag(const InputMouse& input)
 
 void Viewer::initialize()
 {
+    Application::self().add_fdpoll(loaded_notify, [this] {
+        handle_loaded();
+    });
+
     Application::self().add_fdpoll(animation_timer, [this] {
         if (!image) {
             animation_timer.reset(0, 0); // the last image has gone, stop timer
@@ -534,6 +557,10 @@ bool Viewer::set_current(const ImageEntryPtr& entry)
         }
     }
 
+    if (!new_image && this == &Viewer::self() && !entry->is_special()) {
+        // show thumbnail immediately, full image is decoded in background
+        new_image = load_progressive(entry);
+    }
     if (!new_image) {
         new_image = FormatFactory::self().load(entry);
     }
@@ -566,6 +593,20 @@ void Viewer::window_resize(const Size& wnd)
 
 void Viewer::window_redraw(Canvas& wnd)
 {
+    if (placeholder.full) {
+        // max time per frame to spend on preparing the full image
+        constexpr double preload_budget = 0.004;
+        if (!is_placeholder() || placeholder.full->entry != image->entry) {
+            placeholder.full = nullptr;
+        } else if (wnd.preload(placeholder.full->frames[0].pm,
+                               placeholder.full, preload_budget,
+                               scale / placeholder.ratio)) {
+            show_full();
+        } else {
+            Application::redraw(); // continue in the next frame
+        }
+    }
+
     if (!image) {
         const argb_t* bkg = std::get_if<argb_t>(&window_bkg);
         draw_empty(wnd, bkg ? *bkg : Defaults::viewer::window_bkg);
@@ -888,6 +929,19 @@ bool Viewer::animate(const double dt)
         }
     }
 
+    // full image was shown during opening transition: finish postponed work
+    if (after_transition && !clip_anim) {
+        after_transition = false;
+        if (image && !is_placeholder()) {
+            if (placeholder.reset) {
+                reset();
+                in_progress = true;
+            }
+            preloader_start();
+        }
+        placeholder.reset = false;
+    }
+
     return in_progress;
 }
 
@@ -1084,6 +1138,14 @@ void Viewer::stop_video()
 
 void Viewer::prewarm_video()
 {
+#ifdef HAVE_HWDECODE
+    // open GPU decoder device in background, it takes tens of milliseconds
+    loader.add([] {
+        lower_thread_priority();
+        HwDecode::warmup();
+    });
+#endif
+
     if (!video && EmbeddedVideo::available()) {
         video = std::make_unique<EmbeddedVideo>();
         if (!video->prepare()) {
@@ -1181,7 +1243,7 @@ void Viewer::handle_imagelist(const ImageListEvent event,
 
 void Viewer::set_image(const ImagePtr& img)
 {
-    if (image && image != img) {
+    if (image && image != img && !is_placeholder()) {
         // put current image to history
         const std::scoped_lock lock(image_pool.mutex);
         image_pool.history.put(image);
@@ -1191,6 +1253,12 @@ void Viewer::set_image(const ImagePtr& img)
         (!img ||
          (img->entry != video_entry && img->entry != video_pending))) {
         stop_video(); // another image: stop playback
+    }
+
+    if (placeholder.full && (!img || img != placeholder.image)) {
+        const std::scoped_lock lock(image_pool.mutex);
+        image_pool.history.put(placeholder.full);
+        placeholder.full = nullptr;
     }
 
     image = img;
@@ -1232,7 +1300,7 @@ void Viewer::set_image(const ImagePtr& img)
         if (std::holds_alternative<Scale>(default_scale)) {
             set_scale(std::get<Scale>(default_scale));
         } else {
-            set_scale(std::get<double>(default_scale));
+            set_scale(std::get<double>(default_scale) * pixel_ratio());
         }
 
         set_position(default_pos);
@@ -1240,12 +1308,178 @@ void Viewer::set_image(const ImagePtr& img)
 
     previmg = pm;
 
+    if (is_placeholder()) {
+        // remember default view to detect user's zoom/pan while loading
+        placeholder.scale = scale;
+        placeholder.position = position;
+    }
+
     enable_animation(is_animation);
 
-    preloader_start();
+    if (!is_placeholder()) {
+        // otherwise started when the full image is shown, so preloading
+        // doesn't slow down loading of the current image
+        preloader_start();
+    }
 
     switch_current();
     update_text(TextUpdate::All);
+}
+
+ImagePtr Viewer::load_progressive(const ImageEntryPtr& entry)
+{
+    // "keep" mode uses absolute scale between images, not worth handling
+    if (std::holds_alternative<Scale>(default_scale) &&
+        std::get<Scale>(default_scale) == Scale::Keep) {
+        return nullptr;
+    }
+
+    Size orig;
+    Pixmap thumb = FdoThumb::load(entry->path, &orig);
+    if (!thumb) {
+        return nullptr;
+    }
+
+    const double tw = thumb.width();
+    const double th = thumb.height();
+    bool exact = false;
+    double ratio = 1.0;
+    if (orig) {
+        // metadata contains size before EXIF orientation fix
+        const double aspect = tw / th;
+        const double a1 = static_cast<double>(orig.width) / orig.height;
+        const double a2 = static_cast<double>(orig.height) / orig.width;
+        if (std::abs(a1 - aspect) / aspect < 0.02) {
+            ratio = orig.width / tw;
+            exact = true;
+        } else if (std::abs(a2 - aspect) / aspect < 0.02) {
+            ratio = orig.height / tw;
+            exact = true;
+        }
+    }
+    if (exact && ratio <= 1.0) {
+        return nullptr; // thumbnail is not smaller than the image itself
+    }
+
+    ImagePtr img = std::make_shared<Image>();
+    img->frames.resize(1);
+    img->frames[0].pm = std::move(thumb);
+    img->entry = entry;
+
+    placeholder.image = img;
+    placeholder.ratio = ratio;
+
+    // decode the full image, drop the queued (not started) requests
+    loader.cancel();
+    loader.add([this, entry] {
+        lower_thread_priority();
+        ImagePtr full = FormatFactory::self().load(entry);
+        {
+            const std::scoped_lock lock(loaded_mutex);
+            loaded.emplace_back(entry, std::move(full));
+        }
+        loaded_notify.set();
+    });
+
+    Log::verbose("Show thumbnail of {} while loading",
+                 entry->path.filename().string());
+
+    return img;
+}
+
+void Viewer::handle_loaded()
+{
+    std::vector<std::pair<ImageEntryPtr, ImagePtr>> results;
+    {
+        const std::scoped_lock lock(loaded_mutex);
+        results.swap(loaded);
+        loaded_notify.reset();
+    }
+
+    for (auto& [entry, full] : results) {
+        const bool current = is_placeholder() && image->entry == entry;
+
+        if (!full) {
+            Log::error("Unable to load {}", entry->path.string());
+            if (current) {
+                placeholder.image = nullptr; // keep showing the thumbnail
+            }
+            continue;
+        }
+
+        if (!current) {
+            // the user moved on: keep it for later
+            const std::scoped_lock lock(image_pool.mutex);
+            image_pool.history.put(full);
+            continue;
+        }
+
+        // the thumbnail is replaced when the full image is ready to be drawn
+        // (uploaded to GPU in small steps, see window_redraw)
+        placeholder.full = full;
+        Application::redraw();
+    }
+}
+
+void Viewer::show_full()
+{
+    const ImagePtr full = std::move(placeholder.full);
+    placeholder.full = nullptr;
+
+    // replace thumbnail with the full image in place: convert all scale
+    // factors to the new pixmap size, positions stay the same
+    const Pixmap& thumb = image->frames[0].pm;
+    const Pixmap& pm = full->frames[0].pm;
+    const double k = static_cast<double>(thumb.width()) / pm.width();
+    const bool untouched = scale == placeholder.scale &&
+        position.x == placeholder.position.x &&
+        position.y == placeholder.position.y;
+
+    image = full;
+    placeholder.image = nullptr;
+    frame_index = 0;
+
+    scale *= k;
+    if (view_scale > 0) {
+        view_scale *= k;
+    }
+    view_anim.s0 *= k;
+    view_anim.s1 *= k;
+    previmg = pm;
+
+    if (untouched && !view_locked) {
+        // land exactly on the default view of the full image (smoothly
+        // if the thumbnail size didn't match the image); not during the
+        // opening transition: it would restart the animation
+        if (clip_anim) {
+            placeholder.reset = true;
+        } else {
+            reset();
+        }
+    }
+
+    if (is_active()) {
+        const bool is_animation =
+            image->frames.size() > 1 && image->frames[0].duration;
+        Application::get_ui()->set_ctype(is_animation
+                                             ? Ui::ContentType::Animation
+                                             : Ui::ContentType::Static);
+        enable_animation(is_animation);
+        update_text(TextUpdate::All);
+        if (clip_anim) {
+            after_transition = true; // don't slow down the transition
+        } else {
+            preloader_start();
+        }
+    }
+}
+
+void Viewer::stop_loading()
+{
+    loader.cancel();
+    loader.wait();
+    const std::scoped_lock lock(loaded_mutex);
+    loaded.clear();
 }
 
 void Viewer::set_frame(const size_t index)
@@ -1279,10 +1513,12 @@ void Viewer::update_text(const TextUpdate what) const
 
     if (what == TextUpdate::All || what == TextUpdate::Scale) {
         std::wstring tscale;
-        if (scale >= 0.1) {
-            tscale = std::format(L"{}%", static_cast<size_t>(scale * 100));
+        const double real_scale = scale / pixel_ratio();
+        if (real_scale >= 0.1) {
+            tscale =
+                std::format(L"{}%", static_cast<size_t>(real_scale * 100));
         } else {
-            tscale = std::format(L"{:.02}%", scale * 100);
+            tscale = std::format(L"{:.02}%", real_scale * 100);
         }
         text.set_field(Text::FIELD_SCALE, tscale);
     }
@@ -1355,6 +1591,7 @@ void Viewer::fixup_position()
 void Viewer::preloader_work()
 {
     assert(image);
+    lower_thread_priority();
 
     ImageList& il = ImageList::self();
     ImagePtr current_image = image;

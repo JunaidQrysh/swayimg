@@ -258,7 +258,8 @@ void Gallery::initialize()
 void Gallery::activate(const ImageEntryPtr& entry, const Size& wnd)
 {
     AppMode::activate(entry, wnd);
-    layout.select(entry && !entry->removed ? entry : nullptr);
+    // keep scroll position if the image is visible (back from viewer)
+    layout.select_keep_scroll(entry && !entry->removed ? entry : nullptr);
     layout.set_window_size(wnd);
 
     // postpone the first frame until visible thumbnails are loaded
@@ -270,7 +271,8 @@ void Gallery::activate(const ImageEntryPtr& entry, const Size& wnd)
         fade.clear();
     }
 
-    set_current(entry);
+    refresh();
+    switch_current();
 
     // no selection animation on activation
     sel_last = layout.get_selected();

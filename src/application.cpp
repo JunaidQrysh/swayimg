@@ -127,6 +127,7 @@ int Application::run()
     event_loop();
     current_mode()->deactivate();
     Viewer::self().release_video(); // free GPU resources while UI exists
+    Viewer::self().stop_loading();
     ui->stop();
 
     return exit_code;

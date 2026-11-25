@@ -4,7 +4,11 @@
 
 #include "pixmap.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cstring>
+#include <thread>
+#include <vector>
 
 void Pixmap::touch()
 {
@@ -19,7 +23,7 @@ Pixmap::Pixmap(const Format format, const size_t width, const size_t height,
 }
 
 void Pixmap::create(const Format format, const size_t width,
-                    const size_t height)
+                    const size_t height, const bool clear)
 {
     touch();
     pm_format = format;
@@ -39,7 +43,12 @@ void Pixmap::create(const Format format, const size_t width,
     pm_stride = pm_width * pm_bpp;
 
     pm_ext = nullptr;
-    pm_data.resize(pm_height * pm_stride);
+    const size_t prev = pm_data.size();
+    const size_t size = pm_height * pm_stride;
+    pm_data.resize(size);
+    if (clear && size > prev) {
+        std::memset(pm_data.data() + prev, 0, size - prev); // new data only
+    }
 }
 
 void Pixmap::attach(const Format format, const size_t width,
@@ -147,7 +156,7 @@ void Pixmap::rotate(const size_t angle)
     } else if (angle == 90 || angle == 270) {
         // create temporary buffer with origin data
         Pixmap origin;
-        origin.create(pm_format, pm_width, pm_height);
+        origin.create(pm_format, pm_width, pm_height, false);
         std::memcpy(origin.ptr(0, 0), ptr(0, 0), pm_height * pm_stride);
 
         // change orientation
@@ -155,20 +164,44 @@ void Pixmap::rotate(const size_t angle)
         pm_height = origin.pm_width;
         pm_stride = pm_width * pm_bpp;
 
-        // rotate
-        for (size_t y = 0; y < pm_height; ++y) {
-            for (size_t x = 0; x < pm_width; ++x) {
-                size_t origin_x;
-                size_t origin_y;
-                if (angle == 90) {
-                    origin_x = y;
-                    origin_y = origin.pm_height - 1 - x;
-                } else {
-                    origin_x = origin.pm_width - 1 - y;
-                    origin_y = x;
+        // rotate by blocks (cache friendly) in multiple threads
+        constexpr size_t block = 64;
+        const size_t rows = (pm_height + block - 1) / block;
+        const size_t nthreads = std::clamp<size_t>(
+            std::min<size_t>(std::thread::hardware_concurrency() / 2, rows), 1,
+            8);
+        const argb_t* src = &origin.at(0, 0);
+        const size_t src_w = origin.pm_width;
+        const size_t src_h = origin.pm_height;
+        const size_t dst_w = pm_width;
+        argb_t* dst = &at(0, 0);
+
+        const auto worker = [&](const size_t first) {
+            for (size_t by = first; by < rows; by += nthreads) {
+                const size_t y0 = by * block;
+                const size_t y1 = std::min(y0 + block, pm_height);
+                for (size_t x0 = 0; x0 < pm_width; x0 += block) {
+                    const size_t x1 = std::min(x0 + block, pm_width);
+                    for (size_t y = y0; y < y1; ++y) {
+                        argb_t* line = dst + y * dst_w;
+                        for (size_t x = x0; x < x1; ++x) {
+                            // 90: (x,y) <- (y, h-1-x); 270: (x,y) <- (w-1-y, x)
+                            const size_t ox = angle == 90 ? y : src_w - 1 - y;
+                            const size_t oy = angle == 90 ? src_h - 1 - x : x;
+                            line[x] = src[oy * src_w + ox];
+                        }
+                    }
                 }
-                at(x, y) = origin.at(origin_x, origin_y);
             }
+        };
+
+        std::vector<std::thread> threads;
+        for (size_t i = 1; i < nthreads; ++i) {
+            threads.emplace_back(worker, i);
+        }
+        worker(0);
+        for (auto& it : threads) {
+            it.join();
         }
     }
 }

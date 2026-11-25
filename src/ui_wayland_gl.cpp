@@ -7,6 +7,8 @@
 
 #include <EGL/eglext.h>
 
+#include <cstring>
+
 WaylandGl::~WaylandGl()
 {
     if (egl_display == EGL_NO_DISPLAY) {
@@ -18,6 +20,9 @@ WaylandGl::~WaylandGl()
     canvas.reset(); // free GL resources while context is current
     eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                    EGL_NO_CONTEXT);
+    if (upload_context != EGL_NO_CONTEXT) {
+        eglDestroyContext(egl_display, upload_context);
+    }
     if (egl_surface != EGL_NO_SURFACE) {
         eglDestroySurface(egl_display, egl_surface);
     }
@@ -88,6 +93,29 @@ bool WaylandGl::initialize(wl_display* display)
         return false;
     }
 
+    // shared context for uploading textures in background thread
+    const char* ext = eglQueryString(egl_display, EGL_EXTENSIONS);
+    if (ext && strstr(ext, "EGL_KHR_surfaceless_context")) {
+        // low priority: GPU runs frames of the main context first
+        const bool prio = strstr(ext, "EGL_IMG_context_priority");
+        const EGLint upload_attrs[] = {
+            EGL_CONTEXT_MAJOR_VERSION,
+            3,
+            EGL_CONTEXT_MINOR_VERSION,
+            0,
+            prio ? EGL_CONTEXT_PRIORITY_LEVEL_IMG : EGL_NONE,
+            EGL_CONTEXT_PRIORITY_LOW_IMG,
+            EGL_NONE,
+        };
+        upload_context = eglCreateContext(egl_display, egl_config,
+                                          egl_context, upload_attrs);
+        Log::verbose("EGL: background upload context (priority {})",
+                     prio ? "low" : "default");
+    }
+    if (upload_context == EGL_NO_CONTEXT) {
+        Log::verbose("EGL: background texture upload is not available");
+    }
+
     return true;
 }
 
@@ -123,6 +151,20 @@ GlCanvas* WaylandGl::begin(wl_surface* surface, const Size& size)
             canvas.reset();
             failed = true;
             return nullptr;
+        }
+        if (upload_context != EGL_NO_CONTEXT) {
+            EGLDisplay dpy = egl_display;
+            EGLContext ctx = upload_context;
+            canvas->enable_async_upload(
+                [dpy, ctx] {
+                    return eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                                          ctx) == EGL_TRUE;
+                },
+                [dpy] {
+                    eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                                   EGL_NO_CONTEXT);
+                    eglReleaseThread();
+                });
         }
         window_size = size;
     } else if (size.width != window_size.width ||

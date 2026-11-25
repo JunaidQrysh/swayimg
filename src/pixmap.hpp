@@ -9,6 +9,7 @@
 
 #include <cassert>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 class Pixmap {
@@ -32,8 +33,11 @@ public:
      * Create pixmap.
      * @param format pixmap format
      * @param width,height pixel map size
+     * @param clear false to skip clearing of the pixel data (when the caller
+     *              overwrites all pixels, saves time on large images)
      */
-    void create(const Format format, const size_t width, const size_t height);
+    void create(const Format format, const size_t width, const size_t height,
+                const bool clear = true);
 
     /**
      * Attach pixmap to existing buffer.
@@ -263,7 +267,19 @@ private:
     size_t pm_width = 0;          ///< Width in pixels
     size_t pm_height = 0;         ///< Height in pixels
     size_t pm_stride = 0;         ///< Row size in bytes
-    std::vector<uint8_t> pm_data; ///< Pixel data (owned)
+    /** Allocator that doesn't initialize elements on resize. */
+    template <typename T> struct NoInitAllocator : std::allocator<T> {
+        template <typename U> struct rebind {
+            using other = NoInitAllocator<U>;
+        };
+        using std::allocator<T>::allocator;
+        template <typename U> void construct(U* ptr) noexcept
+        {
+            ::new (static_cast<void*>(ptr)) U;
+        }
+    };
+
+    std::vector<uint8_t, NoInitAllocator<uint8_t>> pm_data; ///< Pixel data
     uint8_t* pm_ext = nullptr;    ///< Pixel data (attached)
     uint64_t pm_id = 0;           ///< Unique identifier
 };

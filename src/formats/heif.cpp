@@ -4,14 +4,22 @@
 
 #include "../formatfactory.hpp"
 #include "../imageformat.hpp"
+#include "buildconf.hpp"
 
 #include <libheif/heif.h>
+#include <libheif/heif_properties.h>
 
 #include <cstring>
 #include <memory>
 #include <utility>
 
+#ifdef HAVE_HWDECODE
+#include "../hwdecode.hpp"
+#include "../log.hpp"
+#endif
+
 namespace {
+
 
 class ImageFormatHeif : public ImageFormat {
 public:
@@ -47,6 +55,23 @@ public:
             return nullptr;
         }
         const HeifImageHandle himh(pih, &heif_image_handle_release);
+
+#ifdef HAVE_HWDECODE
+        // fast path: decode tile grid on GPU, transformations, alpha and
+        // other special cases are left to libheif
+        const heif_item_id item = heif_image_handle_get_item_id(himh.get());
+        if (!heif_image_handle_has_alpha_channel(himh.get()) &&
+            heif_item_get_transformation_properties(hctx.get(), item, nullptr,
+                                                    0) == 0) {
+            ImagePtr image = std::make_shared<Image>();
+            image->frames.resize(1);
+            if (HwDecode::heif_grid(data, image->frames[0].pm)) {
+                image->format = "HEIF";
+                return image;
+            }
+            Log::verbose("HEIF: hardware decoding failed, use libheif");
+        }
+#endif
 
         HeifDecOpts hopt(heif_decoding_options_alloc(),
                          &heif_decoding_options_free);

@@ -84,6 +84,13 @@ public:
     void select(const ImageEntryPtr& image);
 
     /**
+     * Select image keeping the current scroll position if the image is
+     * visible (e.g. when returning from the viewer).
+     * @param image image entry to select
+     */
+    void select_keep_scroll(const ImageEntryPtr& image);
+
+    /**
      * Move selection.
      * @param dir movement direction
      * @return true if selection was changed

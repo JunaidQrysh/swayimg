@@ -7,6 +7,7 @@
 #include "appmode.hpp"
 #include "fdevent.hpp"
 #include "fling.hpp"
+#include "threadpool.hpp"
 
 #include <memory>
 
@@ -332,7 +333,42 @@ public:
     /** Initialize video player in advance (GL context must be current). */
     void prewarm_video();
 
+    /** Stop background loading (before the application exits). */
+    void stop_loading();
+
 private:
+
+    /**
+     * Create placeholder from the freedesktop thumbnail and start decoding
+     * the full image in background.
+     * @param entry image entry to load
+     * @return placeholder image or nullptr if thumbnail is not available
+     */
+    ImagePtr load_progressive(const ImageEntryPtr& entry);
+
+    /** Handle images decoded in background (main thread). */
+    void handle_loaded();
+
+    /** Replace placeholder with the decoded full image. */
+    void show_full();
+
+    /**
+     * Check if a placeholder (thumbnail) is currently shown.
+     * @return true if the full image is still loading
+     */
+    [[nodiscard]] bool is_placeholder() const
+    {
+        return image && image == placeholder.image;
+    }
+
+    /**
+     * Get ratio between full image and displayed pixmap size.
+     * @return ratio (1.0 if the full image is shown)
+     */
+    [[nodiscard]] double pixel_ratio() const
+    {
+        return is_placeholder() ? placeholder.ratio : 1.0;
+    }
 
     /**
      * Set current image.
@@ -482,6 +518,23 @@ protected:
     double pan_vy = 0;        ///< Vertical velocity (px/sec)
     double pan_rx = 0;        ///< Fractional horizontal remainder
     double pan_ry = 0;        ///< Fractional vertical remainder
+
+    /** Placeholder shown while the full image is being decoded. */
+    struct {
+        ImagePtr image;     ///< Placeholder image (thumbnail)
+        double ratio = 1.0; ///< Full image size / thumbnail size
+        ImagePtr full;      ///< Decoded full image waiting to be shown
+        bool reset = false; ///< Reset view after the opening transition
+        double scale = 0;   ///< Default scale of the placeholder
+        Point position;     ///< Default position of the placeholder
+    } placeholder;
+
+    bool after_transition = false; ///< Postponed work after transition
+
+    ThreadPool loader { 1 }; ///< Background decoder of the current image
+    std::mutex loaded_mutex; ///< Sync mutex for loaded results
+    std::vector<std::pair<ImageEntryPtr, ImagePtr>> loaded; ///< Decoded
+    FdEvent loaded_notify; ///< Notification about decoded image
 
     /** Image pool. */
     struct ImagePool {

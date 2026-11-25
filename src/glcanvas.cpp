@@ -7,8 +7,12 @@
 #include "render.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+
+#include <sys/resource.h>
+#include <unistd.h>
 
 namespace {
 
@@ -148,8 +152,86 @@ void set_wrap(const GLint mode)
 
 } // namespace
 
+/**
+ * Downscale pixmap by 2^level with box filter (multiple threads).
+ * @param src source pixmap
+ * @param level downscale level
+ * @return downscaled pixmap
+ */
+static Pixmap downscale(const Pixmap& src, const size_t level)
+{
+    const size_t f = static_cast<size_t>(1) << level;
+    const size_t sw = src.width();
+    const size_t sh = src.height();
+    const size_t dw = (sw + f - 1) / f;
+    const size_t dh = (sh + f - 1) / f;
+
+    Pixmap dst;
+    dst.create(src.format(), dw, dh, false);
+
+    const auto worker = [&](const size_t first, const size_t step) {
+        for (size_t y = first; y < dh; y += step) {
+            const size_t y0 = y * f;
+            const size_t y1 = std::min(y0 + f, sh);
+            for (size_t x = 0; x < dw; ++x) {
+                const size_t x0 = x * f;
+                const size_t x1 = std::min(x0 + f, sw);
+                uint32_t a = 0, r = 0, g = 0, b = 0;
+                for (size_t sy = y0; sy < y1; ++sy) {
+                    for (size_t sx = x0; sx < x1; ++sx) {
+                        const argb_t& c = src.at(sx, sy);
+                        a += c.a;
+                        r += c.r;
+                        g += c.g;
+                        b += c.b;
+                    }
+                }
+                const uint32_t n = static_cast<uint32_t>((y1 - y0) * (x1 - x0));
+                argb_t& d = dst.at(x, y);
+                d.a = static_cast<uint8_t>((a + n / 2) / n);
+                d.r = static_cast<uint8_t>((r + n / 2) / n);
+                d.g = static_cast<uint8_t>((g + n / 2) / n);
+                d.b = static_cast<uint8_t>((b + n / 2) / n);
+            }
+        }
+    };
+
+    // few threads: it runs during animations, limit memory bandwidth use
+    const size_t nthreads =
+        std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 1, 2);
+    std::vector<std::thread> threads;
+    for (size_t i = 1; i < nthreads; ++i) {
+        threads.emplace_back(worker, i, nthreads);
+    }
+    worker(0, nthreads);
+    for (auto& it : threads) {
+        it.join();
+    }
+
+    return dst;
+}
+
 GlCanvas::~GlCanvas()
 {
+    if (up_thread.joinable()) {
+        {
+            const std::scoped_lock lock(up_mutex);
+            up_stop = true;
+        }
+        up_cv.notify_all();
+        up_thread.join();
+    }
+    for (auto& [_, job] : up_jobs) {
+        if (job->reduced_done && !job->reduced_taken) {
+            free_texture(job->reduced);
+            glDeleteSync(job->reduced_fence);
+        }
+        if (job->done) {
+            free_texture(job->tex);
+            glDeleteSync(job->fence);
+        }
+    }
+
     for (auto& [_, tex] : textures) {
         free_texture(tex);
     }
@@ -217,6 +299,29 @@ bool GlCanvas::initialize()
 
 void GlCanvas::begin(const Size& size)
 {
+    if (up_thread.joinable()) {
+        last_frame_time.store(
+            std::chrono::steady_clock::now().time_since_epoch().count(),
+            std::memory_order_relaxed);
+        collect_uploads();
+    }
+
+    // window resized: resize offscreen targets now (e.g. the window becomes
+    // fullscreen at startup), not in the middle of the next animation
+    if (layer.fbo && (layer.size.width != size.width ||
+                      layer.size.height != size.height)) {
+        resize_target(layer, size);
+        const Size blur_size = {
+            std::max(size.width / BLUR_DOWNSCALE, static_cast<size_t>(1)),
+            std::max(size.height / BLUR_DOWNSCALE, static_cast<size_t>(1)),
+        };
+        for (Target& it : blur) {
+            if (it.fbo) {
+                resize_target(it, blur_size);
+            }
+        }
+    }
+
     fb_size = size;
     layer_active = false;
     bind_target(nullptr);
@@ -670,10 +775,33 @@ void GlCanvas::warmup()
     dim_outside({ 32, 32 }, 10, 0.5);
     end_layer(0.5);
     glFinish();
+    free_target(warm);
+
+    // repeat transition-like drawing at the window size: allocates layer
+    // and blur targets, otherwise it happens on the first mode transition
+    Target full;
+    if (prev_size && resize_target(full, prev_size)) {
+        const Rectangle win { 0, 0, prev_size.width, prev_size.height };
+        const Rectangle center { static_cast<ssize_t>(prev_size.width / 4),
+                                 static_cast<ssize_t>(prev_size.height / 4),
+                                 prev_size.width / 2, prev_size.height / 2 };
+        fb_size = prev_size;
+        output = &full;
+        layer_active = false;
+        bind_output();
+        fill(win, { 0xff, 0, 0, 0 });
+        begin_layer();
+        draw(rgb, { center.x, center.y }, 8.0);
+        background(Background::Mirror, center);
+        background(Background::Extend, center);
+        end_layer(0.5);
+        draw(rgb, { center.x, center.y }, 8.0, win, 0.5);
+        glFinish();
+        free_target(full);
+    }
 
     output = nullptr;
     fb_size = prev_size;
-    free_target(warm);
 
     // drop temporary textures
     for (const Pixmap* pm : { &argb, &rgb, &gs }) {
@@ -785,25 +913,259 @@ GlCanvas::Program GlCanvas::make_program(const char* fragment)
 const GlCanvas::Texture& GlCanvas::get_texture(const Pixmap& pm,
                                                const bool mipmap)
 {
-    const auto it = textures.find(pm.id());
-    if (it != textures.end()) {
-        Texture& tex = it->second;
+    auto it = textures.find(pm.id());
+    if (it == textures.end()) {
+        Texture tex = create_texture(pm, true);
         tex.last_use = frame;
-        if (mipmap && !tex.mipmap) {
-            for (const Tile& tile : tex.tiles) {
-                glBindTexture(GL_TEXTURE_2D, tile.id);
-                glGenerateMipmap(GL_TEXTURE_2D);
-            }
-            tex.mipmap = true;
-            textures_bytes += tex.bytes / 3;
-            tex.bytes += tex.bytes / 3;
-        }
-        return tex;
+        textures_bytes += tex.bytes;
+        it = textures.insert_or_assign(pm.id(), std::move(tex)).first;
     }
 
-    Texture tex;
+    Texture& tex = it->second;
     tex.last_use = frame;
-    tex.mipmap = mipmap;
+    if (tex.pending) {
+        upload_rows(pm, tex, 0); // not preloaded yet: finish now
+        tex.pending = false;
+    }
+    if (mipmap && !tex.mipmap) {
+        for (const Tile& tile : tex.tiles) {
+            glBindTexture(GL_TEXTURE_2D, tile.id);
+            glGenerateMipmap(GL_TEXTURE_2D);
+        }
+        tex.mipmap = true;
+        textures_bytes += tex.bytes / 3;
+        tex.bytes += tex.bytes / 3;
+    }
+    return tex;
+}
+
+void GlCanvas::enable_async_upload(const std::function<bool()>& bind,
+                                   const std::function<void()>& unbind)
+{
+    up_bind = bind;
+    up_unbind = unbind;
+    up_thread = std::thread(&GlCanvas::upload_worker, this);
+}
+
+void GlCanvas::upload_worker()
+{
+    // background work: don't compete with the render thread
+    setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 10);
+
+    if (!up_bind()) {
+        Log::verbose("GL: unable to bind upload context");
+        up_failed = true;
+        return;
+    }
+
+    while (true) {
+        std::shared_ptr<UploadJob> job;
+        {
+            std::unique_lock lock(up_mutex);
+            up_cv.wait(lock, [this] {
+                return up_stop || !up_queue.empty();
+            });
+            if (up_stop) {
+                break;
+            }
+            job = up_queue.front();
+            up_queue.pop_front();
+        }
+
+        if (job->level) {
+            // first stage: resolution needed for the current view
+            const Pixmap small = downscale(*job->pm, job->level);
+            auto [tex, fence] = upload_async(small, true);
+            // texture covers the area of the origin pixmap
+            for (Tile& tile : tex.tiles) {
+                tile.area = Rectangle(0, 0, job->pm->width(),
+                                      job->pm->height());
+            }
+            tex.reduced = true;
+            const std::scoped_lock lock(up_mutex);
+            job->reduced = std::move(tex);
+            job->reduced_fence = fence;
+            job->reduced_done = true;
+        }
+
+        // full resolution (e.g. for zoom), not urgent if the reduced
+        // texture is already uploaded
+        auto [tex, fence] = upload_async(*job->pm, job->level == 0);
+        const std::scoped_lock lock(up_mutex);
+        job->tex = std::move(tex);
+        job->fence = fence;
+        job->owner.reset(); // pixel data has been copied by GL
+        job->done = true;
+    }
+
+    up_unbind();
+}
+
+std::pair<GlCanvas::Texture, GLsync>
+GlCanvas::upload_async(const Pixmap& pm, const bool urgent) const
+{
+    // allocate, upload and generate mipmaps: all the slow parts
+    Texture tex = create_texture(pm, false);
+    // upload band by band: GL holds a lock shared with the main context
+    // during each call, so pause to let the main thread draw frames;
+    // non-urgent uploads pause longer while animation frames are drawn
+    while (!upload_rows(pm, tex, 1e-9)) {
+        bool animating = false;
+        if (!urgent) {
+            const auto now =
+                std::chrono::steady_clock::now().time_since_epoch().count();
+            const auto idle = std::chrono::steady_clock::duration(
+                now - last_frame_time.load(std::memory_order_relaxed));
+            animating = idle < std::chrono::milliseconds(50);
+        }
+        std::this_thread::sleep_for(
+            std::chrono::microseconds(animating ? 3000 : (urgent ? 1000 : 300)));
+    }
+    for (const Tile& tile : tex.tiles) {
+        glBindTexture(GL_TEXTURE_2D, tile.id);
+        glGenerateMipmap(GL_TEXTURE_2D);
+    }
+    tex.mipmap = true;
+    tex.bytes += tex.bytes / 3;
+    glBindTexture(GL_TEXTURE_2D, 0);
+    GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    return { std::move(tex), fence };
+}
+
+bool GlCanvas::collect_uploads()
+{
+    if (up_failed) {
+        // drop jobs that will never be processed
+        const std::scoped_lock lock(up_mutex);
+        up_queue.clear();
+        up_jobs.clear();
+        return false;
+    }
+
+    // GPU must finish the upload before the texture is used here
+    const auto signaled = [](GLsync fence) {
+        const GLenum rc = glClientWaitSync(fence, 0, 0);
+        return rc == GL_ALREADY_SIGNALED || rc == GL_CONDITION_SATISFIED;
+    };
+
+    const std::scoped_lock lock(up_mutex);
+    for (auto it = up_jobs.begin(); it != up_jobs.end();) {
+        UploadJob& job = *it->second;
+        const uint64_t id = it->first;
+
+        if (job.reduced_done && !job.reduced_taken &&
+            signaled(job.reduced_fence)) {
+            glDeleteSync(job.reduced_fence);
+            job.reduced_taken = true;
+            if (textures.contains(id)) {
+                free_texture(job.reduced); // already created on demand
+            } else {
+                job.reduced.last_use = frame;
+                textures_bytes += job.reduced.bytes;
+                textures.insert_or_assign(id, std::move(job.reduced));
+            }
+        }
+
+        if (!job.done || (job.level && !job.reduced_taken) ||
+            !signaled(job.fence)) {
+            ++it;
+            continue;
+        }
+        glDeleteSync(job.fence);
+        const auto cached = textures.find(id);
+        if (cached != textures.end() && !cached->second.reduced) {
+            free_texture(job.tex); // already created on demand
+        } else {
+            if (cached != textures.end()) {
+                // replace reduced texture with the full one
+                job.tex.last_use = cached->second.last_use;
+                textures_bytes -= cached->second.bytes;
+                free_texture(cached->second);
+            } else {
+                job.tex.last_use = frame;
+            }
+            textures_bytes += job.tex.bytes;
+            textures.insert_or_assign(id, std::move(job.tex));
+        }
+        it = up_jobs.erase(it);
+    }
+    return true;
+}
+
+bool GlCanvas::preload(const Pixmap& pm,
+                       const std::shared_ptr<const void>& owner,
+                       const double budget, const double scale)
+{
+    if (up_thread.joinable() && collect_uploads()) {
+        const auto it = textures.find(pm.id());
+        if (it != textures.end() && !it->second.pending) {
+            it->second.last_use = frame;
+            if (!it->second.mipmap) {
+                get_texture(pm, true);
+            }
+            return true;
+        }
+        if (!up_jobs.contains(pm.id())) {
+            auto job = std::make_shared<UploadJob>();
+            job->pm = &pm;
+            job->owner = owner;
+            // first upload the largest downscaled level that is still not
+            // smaller than the drawn image: much less data to transfer
+            const size_t max_size = static_cast<size_t>(max_tex_size);
+            if (scale > 0 && pm.width() <= max_size &&
+                pm.height() <= max_size && pm.format() != Pixmap::GS) {
+                while (job->level < 4 &&
+                       1.0 / static_cast<double>(1 << (job->level + 1)) >=
+                           scale) {
+                    ++job->level;
+                }
+            }
+            {
+                const std::scoped_lock lock(up_mutex);
+                up_queue.push_back(job);
+            }
+            up_jobs.emplace(pm.id(), job);
+            up_cv.notify_one();
+        }
+        return false;
+    }
+
+    // fallback: upload in small steps within the time budget
+    auto it = textures.find(pm.id());
+    if (it == textures.end()) {
+        // allocate textures now, fill them in the following steps
+        Texture tex = create_texture(pm, false);
+        tex.last_use = frame;
+        tex.pending = true;
+        textures_bytes += tex.bytes;
+        it = textures.insert_or_assign(pm.id(), std::move(tex)).first;
+        return false; // allocation is a step itself
+    }
+
+    Texture& tex = it->second;
+    tex.last_use = frame; // protect from eviction
+
+    if (tex.pending) {
+        if (upload_rows(pm, tex, budget)) {
+            tex.pending = false;
+        }
+        return false; // mipmaps are generated in a separate step
+    }
+
+    if (!tex.mipmap) {
+        // the viewer shows large images downscaled: generate mipmaps
+        // in advance to avoid it on the first draw
+        get_texture(pm, true);
+    }
+
+    return true;
+}
+
+GlCanvas::Texture GlCanvas::create_texture(const Pixmap& pm,
+                                           const bool upload) const
+{
+    Texture tex;
 
     const bool gs = pm.format() == Pixmap::GS;
     const size_t bpp = gs ? 1 : sizeof(argb_t);
@@ -823,13 +1185,26 @@ const GlCanvas::Texture& GlCanvas::get_texture(const Pixmap& pm,
             glPixelStorei(GL_UNPACK_SKIP_PIXELS, static_cast<GLint>(x));
             glPixelStorei(GL_UNPACK_SKIP_ROWS, static_cast<GLint>(y));
 
-            if (gs) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0, GL_RED,
+            const GLsizei tw = static_cast<GLsizei>(w);
+            const GLsizei th = static_cast<GLsizei>(h);
+            if (!upload) {
+                // immutable storage with all mip levels, filled later: cheaper
+                // to allocate and mipmaps are generated without reallocation
+                GLsizei levels = 1;
+                for (size_t sz = std::max(w, h); sz > 1; sz >>= 1) {
+                    ++levels;
+                }
+                glTexStorage2D(GL_TEXTURE_2D, levels, gs ? GL_R8 : GL_RGBA8,
+                               tw, th);
+            } else if (gs) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, tw, th, 0, GL_RED,
                              GL_UNSIGNED_BYTE, pm.ptr(0, 0));
             } else {
-                // pixmap is BGRA in memory, swap channels on sampling
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tw, th, 0, GL_RGBA,
                              GL_UNSIGNED_BYTE, pm.ptr(0, 0));
+            }
+            if (!gs) {
+                // pixmap is BGRA in memory, swap channels on sampling
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
                 if (pm.format() == Pixmap::RGB) {
@@ -838,9 +1213,6 @@ const GlCanvas::Texture& GlCanvas::get_texture(const Pixmap& pm,
                 }
             }
             set_wrap(GL_CLAMP_TO_EDGE);
-            if (mipmap) {
-                glGenerateMipmap(GL_TEXTURE_2D);
-            }
 
             tex.bytes += w * h * bpp;
             tex.tiles.push_back(tile);
@@ -851,12 +1223,61 @@ const GlCanvas::Texture& GlCanvas::get_texture(const Pixmap& pm,
     glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
     glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
 
-    if (mipmap) {
-        tex.bytes += tex.bytes / 3;
-    }
-    textures_bytes += tex.bytes;
+    return tex;
+}
 
-    return textures.insert_or_assign(pm.id(), std::move(tex)).first->second;
+bool GlCanvas::upload_rows(const Pixmap& pm, Texture& tex, const double budget)
+{
+    // rows uploaded at once: small enough to keep the time budget
+    constexpr size_t band_bytes = 2 * 1024 * 1024;
+
+    const auto start = std::chrono::steady_clock::now();
+    const bool gs = pm.format() == Pixmap::GS;
+    const size_t bpp = gs ? 1 : sizeof(argb_t);
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, gs ? 1 : 4);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, static_cast<GLint>(pm.stride() / bpp));
+
+    bool complete = false;
+    while (true) {
+        if (tex.up_tile >= tex.tiles.size()) {
+            complete = true;
+            break;
+        }
+        const Tile& tile = tex.tiles[tex.up_tile];
+        const size_t band = std::max<size_t>(
+            1, band_bytes / (static_cast<size_t>(tile.area.width) * bpp));
+        const size_t rows = std::min(band, tile.area.height - tex.up_row);
+
+        glBindTexture(GL_TEXTURE_2D, tile.id);
+        glPixelStorei(GL_UNPACK_SKIP_PIXELS, static_cast<GLint>(tile.area.x));
+        glPixelStorei(GL_UNPACK_SKIP_ROWS,
+                      static_cast<GLint>(tile.area.y + tex.up_row));
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLint>(tex.up_row),
+                        static_cast<GLsizei>(tile.area.width),
+                        static_cast<GLsizei>(rows), gs ? GL_RED : GL_RGBA,
+                        GL_UNSIGNED_BYTE, pm.ptr(0, 0));
+
+        tex.up_row += rows;
+        if (tex.up_row >= tile.area.height) {
+            ++tex.up_tile;
+            tex.up_row = 0;
+        }
+
+        if (budget > 0 &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          start)
+                    .count() >= budget) {
+            complete = tex.up_tile >= tex.tiles.size();
+            break;
+        }
+    }
+
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+
+    return complete;
 }
 
 void GlCanvas::free_texture(Texture& tex)

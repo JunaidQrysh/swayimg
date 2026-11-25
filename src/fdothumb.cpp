@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <list>
+#include <mutex>
 #include <string>
 
 namespace {
@@ -147,17 +149,70 @@ std::filesystem::path cache_dir()
     return {};
 }
 
-} // namespace
+/** Recently loaded thumbnails: the gallery loads thumbnails of visible
+ * images, the viewer then gets them from memory when an image is opened. */
+class Cache {
+public:
+    struct Entry {
+        std::filesystem::path path; ///< Origin file
+        time_t mtime;               ///< Origin modification time
+        Pixmap thumb;               ///< Thumbnail
+        Size orig;                  ///< Origin image size
+    };
 
-namespace FdoThumb {
-
-Pixmap load(const std::filesystem::path& path)
-{
-    struct stat st;
-    if (stat(path.c_str(), &st) == -1 || !S_ISREG(st.st_mode)) {
-        return {};
+    bool get(const std::filesystem::path& path, const time_t mtime,
+             Pixmap& thumb, Size& orig)
+    {
+        const std::scoped_lock lock(mutex);
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if (it->path == path) {
+                if (it->mtime != mtime) {
+                    bytes -= it->thumb.stride() * it->thumb.height();
+                    entries.erase(it); // origin file changed
+                    return false;
+                }
+                thumb = it->thumb;
+                orig = it->orig;
+                entries.splice(entries.begin(), entries, it); // MRU
+                return true;
+            }
+        }
+        return false;
     }
 
+    void put(Entry&& entry)
+    {
+        const std::scoped_lock lock(mutex);
+        std::erase_if(entries, [this, &entry](const Entry& it) {
+            if (it.path != entry.path) {
+                return false;
+            }
+            bytes -= it.thumb.stride() * it.thumb.height();
+            return true;
+        });
+        bytes += entry.thumb.stride() * entry.thumb.height();
+        entries.push_front(std::move(entry));
+        while (bytes > MAX_BYTES && entries.size() > 1) {
+            const Pixmap& pm = entries.back().thumb;
+            bytes -= pm.stride() * pm.height();
+            entries.pop_back();
+        }
+    }
+
+private:
+    /** Memory limit: holds all thumbnails of a gallery screen. */
+    static constexpr size_t MAX_BYTES = 96 * 1024 * 1024;
+    std::list<Entry> entries;
+    size_t bytes = 0; ///< Total size of cached thumbnails
+    std::mutex mutex;
+};
+
+Cache cache;
+
+/** Load thumbnail from the freedesktop cache directory. */
+Pixmap load_file(const std::filesystem::path& path, const struct stat& st,
+                 Size* orig)
+{
     const std::string uri = file_uri(path);
     const std::filesystem::path base = cache_dir();
     if (uri.empty() || base.empty()) {
@@ -192,7 +247,54 @@ Pixmap load(const std::filesystem::path& path)
         return {};
     }
 
+    if (orig) {
+        const auto it_w = thumb->meta.find("Thumb::Image::Width");
+        const auto it_h = thumb->meta.find("Thumb::Image::Height");
+        if (it_w != thumb->meta.end() && it_h != thumb->meta.end()) {
+            const long w = std::strtol(it_w->second.c_str(), nullptr, 10);
+            const long h = std::strtol(it_h->second.c_str(), nullptr, 10);
+            if (w > 0 && h > 0) {
+                orig->width = static_cast<size_t>(w);
+                orig->height = static_cast<size_t>(h);
+            }
+        }
+    }
+
     return thumb->frames[0].pm;
+}
+
+} // namespace
+
+namespace FdoThumb {
+
+Pixmap load(const std::filesystem::path& path, Size* orig)
+{
+    if (orig) {
+        *orig = {};
+    }
+
+    struct stat st;
+    if (stat(path.c_str(), &st) == -1 || !S_ISREG(st.st_mode)) {
+        return {};
+    }
+
+    Pixmap thumb;
+    Size size;
+    if (cache.get(path, st.st_mtim.tv_sec, thumb, size)) {
+        if (orig) {
+            *orig = size;
+        }
+        return thumb;
+    }
+
+    thumb = load_file(path, st, &size);
+    if (thumb) {
+        cache.put({ path, st.st_mtim.tv_sec, thumb, size });
+    }
+    if (orig) {
+        *orig = size;
+    }
+    return thumb;
 }
 
 } // namespace FdoThumb

@@ -162,6 +162,12 @@ if avformat.found() and avcodec.found() and avutil.found() and swscale.found()
 else
     video = dependency('', required: false)
 endif
+# hardware decoding of photos (HEIF, JPEG)
+libva = dependency('libva', required: false)
+hwdecode_found = video.found() and libva.found()
+if hwdecode_found
+    video = declare_dependency(dependencies: [video, libva])
+endif
 
 # hack to build "pkgconfigless" gif in FreeBSD
 cc = meson.get_compiler('c')
@@ -211,6 +217,7 @@ conf.set('HAVE_LIBRAW', raw.found())
 conf.set('HAVE_LIBWEBP', webp.found())
 conf.set('HAVE_KRITA', krita.found())
 conf.set('HAVE_VIDEO', video.found())
+conf.set('HAVE_HWDECODE', hwdecode_found)
 conf.set_quoted('APP_VERSION', version)
 configure_file(output: 'buildconf.hpp', configuration: conf)
 
@@ -434,6 +441,9 @@ if webp.found()
 endif
 if video.found()
     sources += 'src/formats/video.cpp'
+endif
+if hwdecode_found
+    sources += 'src/hwdecode.cpp'
 endif
 
 dependencies = [
