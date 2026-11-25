@@ -642,39 +642,11 @@ void GlCanvas::raster(const std::function<void(Pixmap&)>& fn)
     quad(0, 0, fb_size.width, fb_size.height);
 }
 
-bool GlCanvas::draw_texture(const TextureRenderer& fn, const Size& src_size,
-                            const double render_scale, const Point& pos,
-                            const double scale, const Rectangle& clip)
+bool GlCanvas::draw_texture(const TextureRenderer& fn)
 {
-    if (!src_size || scale <= 0.0) {
+    if (!fb_size) {
         return false;
     }
-
-    const Rectangle full { 0, 0, fb_size.width, fb_size.height };
-    const Rectangle visible = full.intersect(clip);
-    if (!visible) {
-        return false;
-    }
-
-    const double dst_w = src_size.width * scale;
-    const double dst_h = src_size.height * scale;
-
-    // render at the displayed size (external renderer scales the content
-    // itself), limited to avoid huge textures at high zoom levels
-    double tex_w = src_size.width * (render_scale > 0 ? render_scale : scale);
-    double tex_h = src_size.height * (render_scale > 0 ? render_scale : scale);
-    const double limit = std::min(
-        static_cast<double>(max_tex_size),
-        1.5 * std::max(fb_size.width, fb_size.height));
-    const double over = std::max(tex_w, tex_h) / limit;
-    if (over > 1.0) {
-        tex_w /= over;
-        tex_h /= over;
-    }
-    const Size tex_size {
-        std::max(static_cast<size_t>(std::lround(tex_w)), static_cast<size_t>(1)),
-        std::max(static_cast<size_t>(std::lround(tex_h)), static_cast<size_t>(1)),
-    };
 
     // external renderers (libmpv) expect OpenGL state in standard defaults
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -692,25 +664,18 @@ bool GlCanvas::draw_texture(const TextureRenderer& fn, const Size& src_size,
     glDisable(GL_SCISSOR_TEST);
     blend_mode = Blend::None;
 
-    const GLuint tex = fn(tex_size);
+    const GLuint tex = fn(fb_size);
     reset_state();
     if (!tex) {
         return false;
     }
 
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(visible.x,
-              static_cast<GLint>(fb_size.height) - visible.y -
-                  static_cast<GLint>(visible.height),
-              visible.width, visible.height);
     use(prog_tex, fb_size);
-    set_blend(Blend::None);
+    set_blend(Blend::Premult);
     glBindTexture(GL_TEXTURE_2D, tex);
-    set_filter(GL_LINEAR, GL_LINEAR);
-    quad(static_cast<float>(pos.x), static_cast<float>(pos.y),
-         static_cast<float>(dst_w), static_cast<float>(dst_h),
-         { 0.0f, 1.0f, 1.0f, 0.0f });
-    glDisable(GL_SCISSOR_TEST);
+    set_filter(GL_NEAREST, GL_NEAREST); // 1:1 mapping
+    quad(0.0f, 0.0f, static_cast<float>(fb_size.width),
+         static_cast<float>(fb_size.height), { 0.0f, 1.0f, 1.0f, 0.0f });
 
     return true;
 }

@@ -633,17 +633,6 @@ void Viewer::window_redraw(Canvas& wnd)
     // put image on window surface
     image->draw(frame_index, wnd, vscale, vpos.x, vpos.y);
 
-    // video frame on top of the still preview frame
-    const bool playing = video && video_entry && image->entry == video_entry;
-    if (playing && !clip_anim) {
-        wnd.draw_texture(
-            [this](const Size& size) {
-                return video->render(size);
-            },
-            static_cast<Size>(pm), scale, vpos, vscale,
-            { 0, 0, window_size.width, window_size.height });
-    }
-
     // fill window background
     if (std::holds_alternative<argb_t>(window_bkg)) {
         wnd.fill_inverse(imgr, std::get<argb_t>(window_bkg));
@@ -662,6 +651,18 @@ void Viewer::window_redraw(Canvas& wnd)
                                imgr);
                 break;
         }
+    }
+
+    // video player output (frame on top of the still preview frame and
+    // on-screen controller) covers the whole window
+    if (video_active()) {
+        const double vx = static_cast<double>(vpos.x);
+        const double vy = static_cast<double>(vpos.y);
+        const double vw = pm.width() * vscale;
+        const double vh = pm.height() * vscale;
+        wnd.draw_texture([this, vx, vy, vw, vh](const Size& size) {
+            return video->render(size, vx, vy, vw, vh);
+        });
     }
 
     // mark icon
@@ -717,10 +718,8 @@ void Viewer::handle_mmove(const InputMouse& input, const Point& pos,
     set_position(new_pos);
 
     // show video player's on-screen controller
-    double rx;
-    double ry;
-    if (video_point(pos, rx, ry)) {
-        video->mouse_move(rx, ry);
+    if (video_active() && pos) {
+        video->mouse_move(pos.x, pos.y);
     }
 
     if (focus_radius) {
@@ -772,32 +771,18 @@ void Viewer::handle_pinch_end()
     }
 }
 
-bool Viewer::video_point(const Point& pos, double& rel_x, double& rel_y) const
+bool Viewer::video_active() const
 {
-    if (!video || !video_entry || !image || image->entry != video_entry ||
-        clip_anim || !pos) {
-        return false;
-    }
-    const Pixmap& pm = image->frames[frame_index].pm;
-    const double vscale = view_scale > 0 ? view_scale : scale;
-    const double vx = view_scale > 0 ? view_x : position.x;
-    const double vy = view_scale > 0 ? view_y : position.y;
-    const double w = pm.width() * vscale;
-    const double h = pm.height() * vscale;
-    if (w <= 0 || h <= 0) {
-        return false;
-    }
-    rel_x = (pos.x - vx) / w;
-    rel_y = (pos.y - vy) / h;
-    return rel_x >= 0 && rel_x <= 1 && rel_y >= 0 && rel_y <= 1;
+    return video && video_entry && image && image->entry == video_entry &&
+        !clip_anim;
 }
 
 bool Viewer::handle_mbutton(const InputMouse::mouse_btn_t button,
                             const bool pressed, const Point& pos)
 {
-    double rx;
-    double ry;
-    if (!video_point(pos, rx, ry)) {
+    // player output covers the whole window (on-screen controller is
+    // placed relative to the window, not to the video)
+    if (!video_active() || !pos) {
         return false;
     }
 
@@ -817,7 +802,7 @@ bool Viewer::handle_mbutton(const InputMouse::mouse_btn_t button,
     }
 
     // mouse input goes to video player's on-screen controller
-    video->mouse_move(rx, ry);
+    video->mouse_move(pos.x, pos.y);
     video->mouse_button(name, pressed);
     return true;
 }

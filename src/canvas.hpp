@@ -152,24 +152,12 @@ public:
     using TextureRenderer = std::function<unsigned(const Size&)>;
 
     /**
-     * Draw externally rendered GPU texture (e.g. video frame).
+     * Draw externally rendered GPU texture (e.g. video player output) over
+     * the whole canvas. The texture has canvas size and premultiplied alpha.
      * @param fn callback to render the texture
-     * @param src_size size of the content at scale 1.0
-     * @param render_scale scale used to choose texture size (stable value
-     *                     to avoid re-rendering during animations)
-     * @param pos top-left coordinates of the scaled content
-     * @param scale scale factor relative to native size
-     * @param clip clipping area
      * @return false if not supported or nothing was drawn
      */
-    virtual bool draw_texture(const TextureRenderer& /*fn*/,
-                              const Size& /*src_size*/,
-                              const double /*render_scale*/,
-                              const Point& /*pos*/, const double /*scale*/,
-                              const Rectangle& /*clip*/)
-    {
-        return false;
-    }
+    virtual bool draw_texture(const TextureRenderer& /*fn*/) { return false; }
 
     /**
      * Begin layer: following drawing goes to a separate transparent layer

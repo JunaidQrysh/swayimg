@@ -53,17 +53,21 @@ public:
     [[nodiscard]] bool ready() const { return render_ctx; }
 
     /**
-     * Render current video frame to the texture, GL context must be current.
-     * @param size texture size in pixels
-     * @return GL texture with the frame (bottom-up), 0 if no frame yet
+     * Render player output (video frame and on-screen controller) to the
+     * texture of window size, GL context must be current.
+     * @param size texture (window) size in pixels
+     * @param x,y,w,h video area on the window
+     * @return GL texture (bottom-up, premultiplied alpha, transparent outside
+     *         the video area), 0 if no frame yet
      */
-    unsigned render(const Size& size);
+    unsigned render(const Size& size, const double x, const double y,
+                    const double w, const double h);
 
     /**
      * Move mouse pointer (for on-screen controller).
-     * @param rel_x,rel_y position relative to the video area, in range [0,1]
+     * @param x,y position on the window in pixels
      */
-    void mouse_move(const double rel_x, const double rel_y);
+    void mouse_move(const ssize_t x, const ssize_t y);
 
     /**
      * Press/release mouse button (for on-screen controller).
@@ -117,6 +121,9 @@ private:
     unsigned fbo = 0;
     unsigned texture = 0;
     Size texture_size;
+    double zoom = 0;  ///< Current video-zoom property value
+    double pan_x = 0; ///< Current video-pan-x property value
+    double pan_y = 0; ///< Current video-pan-y property value
     bool playing = false;    ///< Playback is active
     bool frame_seen = false; ///< At least one video frame decoded
     bool started = false;    ///< Playback of the current file started

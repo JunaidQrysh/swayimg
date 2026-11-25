@@ -76,9 +76,7 @@ public:
     void dim_outside(const Point& center, const size_t radius,
                      const double factor) override;
     void raster(const std::function<void(Pixmap&)>& fn) override;
-    bool draw_texture(const TextureRenderer& fn, const Size& src_size,
-                      const double render_scale, const Point& pos,
-                      const double scale, const Rectangle& clip) override;
+    bool draw_texture(const TextureRenderer& fn) override;
     void begin_layer() override;
     bool preload(const Pixmap& pm, const std::shared_ptr<const void>& owner,
                  const double budget, const double scale) override;

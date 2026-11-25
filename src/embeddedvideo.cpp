@@ -13,7 +13,9 @@
 #include <mpv/client.h>
 #include <mpv/render_gl.h>
 
+#include <algorithm>
 #include <clocale>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -71,6 +73,9 @@ bool EmbeddedVideo::init()
         { "idle",                   "yes"       },
         { "terminal",               "no"        },
         { "osc",                    "yes"       },
+        // video is rendered into a window-sized transparent texture
+        { "background",             "color"     },
+        { "background-color",       "#00000000" },
         { "input-default-bindings", "no"        },
         { "input-vo-keyboard",      "no"        },
         { "audio-client-name",      "swayimg"   },
@@ -161,9 +166,10 @@ void EmbeddedVideo::stop()
     pending.clear();
 }
 
-unsigned EmbeddedVideo::render(const Size& size)
+unsigned EmbeddedVideo::render(const Size& size, const double x,
+                               const double y, const double w, const double h)
 {
-    if (!mpv || render_failed || !size) {
+    if (!mpv || render_failed || !size || w <= 0 || h <= 0) {
         return 0;
     }
 
@@ -178,6 +184,27 @@ unsigned EmbeddedVideo::render(const Size& size)
         return 0;
     }
 
+    // place video on the window (before the first frame is rendered): mpv
+    // fits it into the window keeping aspect ratio, video-zoom scales it
+    // (log2) and video-pan moves its center (in units of the scaled video size)
+    bool moved = false;
+    const double fit_w = std::min(static_cast<double>(size.width),
+                                  static_cast<double>(size.height) * w / h);
+    const double new_zoom = std::log2(w / fit_w);
+    const double new_pan_x = (x + w / 2 - size.width / 2.0) / w;
+    const double new_pan_y = (y + h / 2 - size.height / 2.0) / h;
+    const auto set = [this, &moved](const char* name, double& cur,
+                                    double val) {
+        if (std::abs(cur - val) > 1e-6) {
+            cur = val;
+            mpv_set_property_async(mpv, 0, name, MPV_FORMAT_DOUBLE, &val);
+            moved = true;
+        }
+    };
+    set("video-zoom", zoom, new_zoom);
+    set("video-pan-x", pan_x, new_pan_x);
+    set("video-pan-y", pan_y, new_pan_y);
+
     update = false;
     const uint64_t flags = mpv_render_context_update(render_ctx);
     if (started && (flags & MPV_RENDER_UPDATE_FRAME)) {
@@ -187,7 +214,7 @@ unsigned EmbeddedVideo::render(const Size& size)
         return 0; // no video frame decoded yet
     }
 
-    bool redraw = flags & MPV_RENDER_UPDATE_FRAME;
+    bool redraw = moved || (flags & MPV_RENDER_UPDATE_FRAME);
 
     // (re)allocate render target
     if (!fbo || size.width != texture_size.width ||
@@ -231,14 +258,12 @@ unsigned EmbeddedVideo::render(const Size& size)
     return texture;
 }
 
-void EmbeddedVideo::mouse_move(const double rel_x, const double rel_y)
+void EmbeddedVideo::mouse_move(const ssize_t x, const ssize_t y)
 {
-    if (mpv && texture_size) {
-        const std::string x =
-            std::format("{}", static_cast<int>(rel_x * texture_size.width));
-        const std::string y =
-            std::format("{}", static_cast<int>(rel_y * texture_size.height));
-        const char* cmd[] = { "mouse", x.c_str(), y.c_str(), nullptr };
+    if (mpv) {
+        const std::string sx = std::format("{}", x);
+        const std::string sy = std::format("{}", y);
+        const char* cmd[] = { "mouse", sx.c_str(), sy.c_str(), nullptr };
         mpv_command_async(mpv, 0, cmd);
     }
 }
@@ -374,13 +399,14 @@ bool EmbeddedVideo::start(const std::filesystem::path&)
     return false;
 }
 
-unsigned EmbeddedVideo::render(const Size&)
+unsigned EmbeddedVideo::render(const Size&, const double, const double,
+                               const double, const double)
 {
     return 0;
 }
 
 void EmbeddedVideo::stop() {}
-void EmbeddedVideo::mouse_move(const double, const double) {}
+void EmbeddedVideo::mouse_move(const ssize_t, const ssize_t) {}
 void EmbeddedVideo::mouse_button(const char*, const bool) {}
 bool EmbeddedVideo::init()
 {

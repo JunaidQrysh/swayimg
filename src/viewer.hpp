@@ -319,12 +319,10 @@ private:
     void stop_video();
 
     /**
-     * Convert window coordinates to position on the playing video.
-     * @param pos window coordinates
-     * @param rel_x,rel_y output relative position in range [0,1]
-     * @return false if no video is playing or position is out of the video
+     * Check if embedded video of the current image is shown.
+     * @return true if player output is drawn on the window
      */
-    bool video_point(const Point& pos, double& rel_x, double& rel_y) const;
+    [[nodiscard]] bool video_active() const;
 
 public:
     /** Stop playback and free the player (before GL context is destroyed). */
