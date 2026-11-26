@@ -471,7 +471,9 @@ void Defaults::gallery::bind_inputs(Gallery* mode)
         } else {
             if (delta_v) {
                 mode->scroll(delta_v);
-            } else if (delta_h) {
+            } else if (delta_h && !mode->finger_scroll()) {
+                // wheel tilt only: sideways drift of fingers on a touchpad
+                // must not move the selection
                 mode->select(delta_h > 0 ? Layout::Right : Layout::Left);
             }
         }

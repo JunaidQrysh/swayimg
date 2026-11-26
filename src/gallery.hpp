@@ -189,6 +189,12 @@ public:
     void scroll(const double delta);
 
     /**
+     * Check if the current scroll comes from a touchpad.
+     * @return true for finger scrolling
+     */
+    [[nodiscard]] bool finger_scroll() const { return scroll_finger; }
+
+    /**
      * Get tile of the image thumbnail on the window.
      * @param entry image entry
      * @param wnd_size window size
@@ -298,6 +304,13 @@ private:
     void update_visible();
 
     /**
+     * Update selection after free scrolling: select thumbnail under the
+     * pointer (hover selection) or keep the selection visible.
+     * @param use_pointer true to take the pointer position into account
+     */
+    void follow_scroll(const bool use_pointer);
+
+    /**
      * Switch current image after selection followed scrolling (no animation).
      */
     void follow_selection();
@@ -351,6 +364,8 @@ private:
     argb_t clr_border;     ///< Selected tile border
 
     bool hover_select; ///< Mouse hover selection
+    Point pointer;              ///< Last pointer position
+    bool pointer_valid = false; ///< Pointer position is known
     double scroll_speed = 1.5; ///< Touchpad scroll speed multiplier
 
     ThreadPool tpool; ///< Loading threads

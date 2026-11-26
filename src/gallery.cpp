@@ -426,6 +426,9 @@ void Gallery::handle_mmove(const InputMouse&, const Point& pos, const Point&)
         return;
     }
 
+    pointer = pos;
+    pointer_valid = true;
+
     const bool hover = on_scrollbar(pos);
     if (hover != sbar.hover) {
         sbar.hover = hover;
@@ -691,8 +694,8 @@ bool Gallery::animate(const double dt)
     // scrolling
     if (layout.is_animating()) {
         in_progress = layout.animate(dt);
-        if (free_scroll && layout.keep_selection_visible()) {
-            follow_selection();
+        if (free_scroll) {
+            follow_scroll(true);
         }
         on_scrolled();
     }
@@ -762,9 +765,7 @@ void Gallery::scroll(const double delta)
         // keep recent samples (compositor timestamps) for fling velocity
         fling_tracker.add(scroll_time, 0, distance);
 
-        if (layout.keep_selection_visible()) {
-            follow_selection();
-        }
+        follow_scroll(true);
         on_scrolled();
     } else {
         // mouse wheel: animated scroll
@@ -878,9 +879,7 @@ void Gallery::drag_scrollbar(const ssize_t y)
 
     free_scroll = true;
     layout.set_scroll(frac * max);
-    if (layout.keep_selection_visible()) {
-        follow_selection();
-    }
+    follow_scroll(false);
     on_scrolled();
     Application::redraw();
 }
@@ -919,6 +918,22 @@ bool Gallery::handle_mbutton(const InputMouse::mouse_btn_t button,
     }
     Application::redraw();
     return true;
+}
+
+void Gallery::follow_scroll(const bool use_pointer)
+{
+    // with hover selection the selected thumbnail is the one under the
+    // pointer: scrolling moves thumbnails under it, keep the same rule
+    if (use_pointer && hover_select && pointer_valid && !sbar.hover &&
+        layout.at(pointer)) {
+        if (layout.select(pointer)) {
+            follow_selection();
+        }
+        return;
+    }
+    if (layout.keep_selection_visible()) {
+        follow_selection();
+    }
 }
 
 void Gallery::follow_selection()

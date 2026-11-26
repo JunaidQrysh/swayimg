@@ -235,10 +235,15 @@ Pixmap rasterize_glyph(FT_GlyphSlot glyph)
 
     pm.create(color ? Pixmap::ARGB : Pixmap::GS, width, height);
 
-    // copy bitmap to the target pixmap
-    const size_t copy_width = rc_pm.width * (color ? sizeof(argb_t) : 1);
+    // copy bitmap to the target pixmap, skipping the clipped part of the
+    // glyph (e.g. negative left bearing of 'j')
+    const size_t bpp = color ? sizeof(argb_t) : 1;
+    const size_t copy_width = rc_pm.width * bpp;
+    const size_t src_x = rc_pm.x - rc_glyph.x;
+    const size_t src_y = rc_pm.y - rc_glyph.y;
     for (size_t y = 0; y < rc_pm.height; ++y) {
-        const uint8_t* src = &bitmap.buffer[y * bitmap.pitch];
+        const uint8_t* src =
+            &bitmap.buffer[(src_y + y) * bitmap.pitch + src_x * bpp];
         uint8_t* dst = static_cast<uint8_t*>(pm.ptr(rc_pm.x, rc_pm.y + y));
         std::memcpy(dst, src, copy_width);
     }
