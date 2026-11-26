@@ -221,6 +221,18 @@ public:
      */
     [[nodiscard]] argb_t get_window_color() const { return clr_window; }
 
+    /**
+     * Group thumbnails into sections with headers.
+     * @param fn section splitter, nullptr to disable sections
+     * @param height header height in pixels
+     */
+    void set_sections(Layout::Splitter fn, const size_t height);
+
+    /** Section header drawing callback: first entry, header area. */
+    using SectionOverlay =
+        std::function<void(Canvas&, const ImageEntryPtr&, const Rectangle&)>;
+    SectionOverlay section_overlay; ///< Drawn for each visible header
+
     /** Tile overlay drawing callback (e.g. album captions). */
     using TileOverlay = std::function<void(Canvas&, const ImageEntryPtr&,
                                            const Rectangle&, double)>;

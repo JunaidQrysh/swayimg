@@ -927,6 +927,7 @@ ImageList::EntriesArray ImageList::clear()
     EntriesArray removed = entries_arr;
     entries_map.clear();
     entries_arr.clear();
+    ++gen;
 
     FsMonitor::self().clear();
 
@@ -1241,6 +1242,7 @@ ImageEntryPtr ImageList::add_entry(const std::filesystem::path& path,
         entry->size = size;
         entries_map.insert({ entry->path.native(), entry });
         entries_arr.push_back(entry);
+        ++gen;
     }
 
     return entry;
@@ -1274,6 +1276,7 @@ void ImageList::sort(EntriesArray& entries) const
 
 void ImageList::reindex(const size_t index)
 {
+    ++gen;
     const size_t sz = entries_arr.size();
     for (size_t i = index; i < sz; ++i) {
         entries_arr[i]->index = i;

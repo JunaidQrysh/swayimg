@@ -30,6 +30,8 @@ constexpr double SWITCHER_INSET = 4;
 constexpr double SWITCHER_PAD = 22;
 constexpr double SWITCHER_BOTTOM = 22;
 constexpr double HEADER_HEIGHT = 60;
+constexpr double SECTION_HEIGHT = 48;
+constexpr double SECTION_TEXT_GAP = 10;
 constexpr double BUTTON_HEIGHT = 34;
 constexpr double BUTTON_PAD = 16;
 constexpr double FONT_TITLE = 17;
@@ -296,6 +298,73 @@ void draw_text(Canvas& wnd, FontSet& font, const std::wstring& text,
             pt.x += glyph->width();
         }
     }
+}
+
+/**
+ * Get local day range containing the time.
+ * @param time timestamp
+ * @param shift number of days to shift the range
+ * @return start and end of the day
+ */
+std::pair<std::time_t, std::time_t> day_range(const std::time_t time,
+                                              const int shift = 0)
+{
+    std::tm tm {};
+    localtime_r(&time, &tm);
+    tm.tm_hour = 0;
+    tm.tm_min = 0;
+    tm.tm_sec = 0;
+    tm.tm_mday += shift;
+    tm.tm_isdst = -1;
+    const std::time_t begin = std::mktime(&tm);
+    tm.tm_mday += 1;
+    tm.tm_isdst = -1;
+    const std::time_t end = std::mktime(&tm);
+    return { begin, end };
+}
+
+/** Split image list into days (lists sorted by mtime only). */
+std::vector<size_t> split_by_day(const std::vector<ImageEntryPtr>& entries)
+{
+    std::vector<size_t> starts;
+    if (ImageList::self().get_order() != ImageList::Order::Mtime) {
+        return starts;
+    }
+    std::time_t begin = 1;
+    std::time_t end = 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const std::time_t mtime = entries[i]->mtime;
+        if (mtime < begin || mtime >= end) {
+            std::tie(begin, end) = day_range(mtime);
+            starts.push_back(i);
+        }
+    }
+    return starts;
+}
+
+/** Get section title for the day: "Today", "12 Nov", "3 Mar 2024". */
+std::string day_label(const std::time_t time)
+{
+    const std::time_t now = std::time(nullptr);
+    const auto [today, tomorrow] = day_range(now);
+    if (time >= today && time < tomorrow) {
+        return "Today";
+    }
+    if (time >= day_range(now, -1).first && time < today) {
+        return "Yesterday";
+    }
+
+    std::tm tm {};
+    std::tm tm_now {};
+    localtime_r(&time, &tm);
+    localtime_r(&now, &tm_now);
+    char month[64];
+    if (!std::strftime(month, sizeof(month), "%b", &tm)) {
+        month[0] = 0;
+    }
+    return tm.tm_year == tm_now.tm_year
+        ? std::format("{} {}", tm.tm_mday, month)
+        : std::format("{} {} {}", tm.tm_mday, month, tm.tm_year + 1900);
 }
 
 /** Apply opacity to color. */
@@ -785,6 +854,19 @@ void Library::prepare_view(const View new_view)
     update_margins();
 }
 
+void Library::draw_section(Canvas& wnd, const ImageEntryPtr& entry,
+                           const Rectangle& rect)
+{
+    prepare_fonts();
+    const std::wstring text = fit_text(*font_title, to_wide(day_label(entry->mtime)),
+                                       rect.width);
+    const ssize_t th = text_height(*font_title);
+    draw_text(wnd, *font_title, text,
+              { rect.x, rect.y + static_cast<ssize_t>(rect.height) - th -
+                    dp(SECTION_TEXT_GAP) },
+              CLR_TEXT);
+}
+
 void Library::update_margins()
 {
     if (view == View::None) {
@@ -803,6 +885,24 @@ void Library::update_margins()
         margin_top = top;
         margin_bottom = bottom;
         Gallery::self().set_margins(top, bottom);
+    }
+
+    // date sections in photo views
+    const size_t section =
+        (view == View::Photos || view == View::Album) ? dp(SECTION_HEIGHT) : 0;
+    if (section != section_height) {
+        section_height = section;
+        Gallery& gallery = Gallery::self();
+        if (section) {
+            gallery.section_overlay = [this](Canvas& wnd,
+                                             const ImageEntryPtr& entry,
+                                             const Rectangle& rect) {
+                draw_section(wnd, entry, rect);
+            };
+        } else {
+            gallery.section_overlay = nullptr;
+        }
+        gallery.set_sections(section ? split_by_day : nullptr, section);
     }
 }
 

@@ -34,6 +34,25 @@ void Layout::update()
     recalc();
 }
 
+void Layout::set_sections(Splitter fn, const size_t height)
+{
+    const bool anchored = window && sel_entry && !sel_entry->removed && total;
+    const double anchor = anchored ? row_top(selected_row()) - scroll : 0;
+
+    splitter = std::move(fn);
+    header_size = height;
+    starts_valid = false;
+    recalc();
+
+    if (anchored && sel_entry) {
+        velocity = 0;
+        target =
+            std::clamp(row_top(selected_row()) - anchor, 0.0, max_scroll());
+        scroll = target;
+        rebuild();
+    }
+}
+
 void Layout::set_window_size(const Size& size)
 {
     const bool anchored = window && sel_entry && !sel_entry->removed && total;
@@ -148,7 +167,7 @@ void Layout::select_keep_scroll(const ImageEntryPtr& image)
         return;
     }
 
-    const double top = row_top(selected_row()) - thumb_padding - margin_top;
+    const double top = view_top(selected_row());
     const double bottom =
         row_top(selected_row()) + thumb_size + margin_bottom;
     const double view = std::clamp(scroll, 0.0, max_scroll());
@@ -177,6 +196,22 @@ bool Layout::select(const Direction dir)
     ImageEntryPtr next = nullptr;
     double page = 0;
 
+    // vertical movement keeps the column, rows of sections may be shorter
+    const auto vertical = [&](const ssize_t delta) -> ImageEntryPtr {
+        if (sel_entry->removed || !total || !total_rows) {
+            return nullptr;
+        }
+        const size_t row = selected_row();
+        const ssize_t to = static_cast<ssize_t>(row) + delta;
+        if (to < 0) {
+            return il.get(nullptr, ImageList::Dir::First);
+        }
+        if (std::cmp_greater_equal(to, total_rows)) {
+            return il.get(nullptr, ImageList::Dir::Last);
+        }
+        return entry_at(index_at(to, col_of(sel_entry->index)));
+    };
+
     switch (dir) {
         case Direction::First:
             next = il.get(nullptr, ImageList::Dir::First);
@@ -185,16 +220,10 @@ bool Layout::select(const Direction dir)
             next = il.get(nullptr, ImageList::Dir::Last);
             break;
         case Direction::Up:
-            next = il.get(sel_entry, -static_cast<ssize_t>(columns));
-            if (!next) {
-                next = il.get(nullptr, ImageList::Dir::First);
-            }
+            next = vertical(-1);
             break;
         case Direction::Down:
-            next = il.get(sel_entry, columns);
-            if (!next) {
-                next = il.get(nullptr, ImageList::Dir::Last);
-            }
+            next = vertical(1);
             break;
         case Direction::Left:
             next = il.get(sel_entry, ImageList::Dir::Prev);
@@ -203,18 +232,13 @@ bool Layout::select(const Direction dir)
             next = il.get(sel_entry, ImageList::Dir::Next);
             break;
         case Direction::PgUp:
-            next = il.get(sel_entry, -static_cast<ssize_t>(columns * rows));
-            if (!next) {
-                next = il.get(nullptr, ImageList::Dir::First);
-            }
-            page = -static_cast<double>(rows * (thumb_size + thumb_padding));
-            break;
         case Direction::PgDown:
-            next = il.get(sel_entry, columns * rows);
-            if (!next) {
-                next = il.get(nullptr, ImageList::Dir::Last);
+            next = vertical(dir == Direction::PgUp
+                                ? -static_cast<ssize_t>(rows)
+                                : static_cast<ssize_t>(rows));
+            if (next && next != sel_entry) {
+                page = row_top(row_of(next->index)) - row_top(selected_row());
             }
-            page = static_cast<double>(rows * (thumb_size + thumb_padding));
             break;
     }
 
@@ -372,7 +396,6 @@ bool Layout::keep_selection_visible()
         return false;
     }
 
-    const double cell = thumb_size + thumb_padding;
     const size_t row = selected_row();
     const double top = row_top(row) - scroll;
     const double avail = view_height();
@@ -382,19 +405,20 @@ bool Layout::keep_selection_visible()
     }
 
     // range of fully visible rows
-    const double base = scroll - offset_y - thumb_padding;
-    ssize_t first = static_cast<ssize_t>(std::ceil(base / cell));
-    ssize_t last = static_cast<ssize_t>(
-        std::floor((base + avail - thumb_size) / cell));
-    first = std::clamp<ssize_t>(first, 0, total_rows - 1);
-    last = std::clamp<ssize_t>(last, 0, total_rows - 1);
+    const double view_top = scroll + margin_top;
+    const ssize_t first =
+        std::min(rows_above(view_top, true), total_rows - 1);
+    const ssize_t last = static_cast<ssize_t>(rows_above(
+                             view_top + avail - thumb_size, false)) -
+        1;
 
     size_t new_row;
     if (first > last) {
         // thumbnail is larger than window: use the central row
         new_row = std::clamp<ssize_t>(
-            std::floor((scroll + avail / 2.0 - offset_y) / cell), 0,
-            total_rows - 1);
+            static_cast<ssize_t>(rows_above(view_top + avail / 2.0, false)) -
+                1,
+            0, total_rows - 1);
     } else {
         new_row = std::cmp_less(row, first) ? first : last;
     }
@@ -402,11 +426,8 @@ bool Layout::keep_selection_visible()
         return false;
     }
 
-    const size_t col = sel_entry->index % columns;
-    const size_t index = std::min(new_row * columns + col, total - 1);
-    ImageList& il = ImageList::self();
-    const ImageEntryPtr first_entry = il.get(nullptr, ImageList::Dir::First);
-    const ImageEntryPtr entry = first_entry ? il.get(first_entry, index) : nullptr;
+    const ImageEntryPtr entry =
+        entry_at(index_at(new_row, col_of(sel_entry->index)));
     if (!entry || entry == sel_entry) {
         return false;
     }
@@ -425,21 +446,54 @@ void Layout::recalc()
     if (!total) {
         sel_entry = nullptr;
         scheme.clear();
+        headers.clear();
+        sections = { { 0, 0 } };
+        total_rows = 0;
         return;
     }
     if (!sel_entry || sel_entry->removed) {
         sel_entry = il.get(nullptr, ImageList::Dir::First);
     }
 
+    // split the list into sections (only when the list was changed)
+    if (!splitter) {
+        starts.clear();
+    } else if (!starts_valid || list_gen != il.generation()) {
+        list_gen = il.generation();
+        starts = splitter(il.get_all());
+        std::erase_if(starts, [this](size_t i) { return i >= total; });
+        if (!starts.empty() && starts.front() != 0) {
+            starts.insert(starts.begin(), 0);
+        }
+    }
+    starts_valid = true;
+    header = starts.empty() ? 0 : header_size;
+
     const size_t cell = thumb_size + thumb_padding;
     columns = std::max(static_cast<size_t>(1), window.width / cell);
     const size_t avail = static_cast<size_t>(view_height());
     rows = std::max(static_cast<size_t>(1), avail / cell);
-    total_rows = (total + columns - 1) / columns;
+
+    sections.clear();
+    total_rows = 0;
+    if (starts.empty()) {
+        sections.push_back({ 0, 0 });
+        total_rows = (total + columns - 1) / columns;
+    } else {
+        for (size_t i = 0; i < starts.size(); ++i) {
+            const size_t end = i + 1 < starts.size() ? starts[i + 1] : total;
+            if (end <= starts[i]) {
+                continue; // unsorted or duplicate start
+            }
+            sections.push_back({ starts[i], total_rows });
+            total_rows += (end - starts[i] + columns - 1) / columns;
+        }
+    }
 
     const size_t used_cols = std::min(columns, total);
     offset_x = (window.width - std::min(window.width, used_cols * cell)) / 2;
-    const size_t content_height = total_rows * cell;
+    const size_t content_height =
+        total_rows * cell + sections.size() * header;
     offset_y = content_height < avail ? (avail - content_height) / 2 : 0;
 
     const double max = max_scroll();
@@ -452,7 +506,8 @@ void Layout::recalc()
 void Layout::rebuild()
 {
     scheme.clear();
-    if (!total || !window) {
+    headers.clear();
+    if (!total || !window || !total_rows) {
         return;
     }
 
@@ -463,9 +518,37 @@ void Layout::rebuild()
     }
 
     const double cell = thumb_size + thumb_padding;
-    size_t row = static_cast<size_t>(
-        std::max(0.0, std::floor((scroll - offset_y - margin_top) / cell)));
+    size_t row = rows_above(scroll - thumb_size, false);
+    if (row) {
+        --row; // last row starting above the window may be still visible
+    }
     size_t rel_row = 0;
+
+    // section headers
+    if (header) {
+        const size_t used_cols = std::min(columns, total);
+        for (size_t sec = section_of_row(row); sec < sections.size(); ++sec) {
+            const double top = row_top(sections[sec].row) - thumb_padding -
+                header - scroll;
+            if (top >= window.height) {
+                break;
+            }
+            if (top + header <= 0) {
+                continue;
+            }
+            Header hdr;
+            hdr.first = il.get(first_entry, sections[sec].first);
+            if (!hdr.first) {
+                break;
+            }
+            hdr.rect = { offset_x + static_cast<ssize_t>(thumb_padding),
+                         static_cast<ssize_t>(std::lround(top)),
+                         used_cols * static_cast<size_t>(cell) -
+                             thumb_padding,
+                         header };
+            headers.emplace_back(hdr);
+        }
+    }
 
     for (; row < total_rows; ++row) {
         const double top = row_top(row) - scroll;
@@ -475,11 +558,10 @@ void Layout::rebuild()
         if (top + thumb_size <= 0) {
             continue; // above the window
         }
-        for (size_t col = 0; col < columns; ++col) {
-            const size_t index = row * columns + col;
-            if (index >= total) {
-                break;
-            }
+        const size_t first = row_first(row);
+        const size_t end = row_end(row);
+        for (size_t index = first; index < end; ++index) {
+            const size_t col = index - first;
             Thumbnail thumb;
             thumb.img = il.get(first_entry, index);
             if (!thumb.img) {
@@ -497,7 +579,8 @@ void Layout::rebuild()
 
 double Layout::max_scroll() const
 {
-    const double content = total_rows * (thumb_size + thumb_padding);
+    const double content = total_rows * (thumb_size + thumb_padding) +
+        sections.size() * header;
     return std::max(0.0, content - view_height());
 }
 
@@ -511,7 +594,8 @@ double Layout::row_top(const size_t row) const
 {
     return margin_top + offset_y +
         static_cast<double>(row * (thumb_size + thumb_padding)) +
-        thumb_padding;
+        thumb_padding +
+        static_cast<double>((section_of_row(row) + 1) * header);
 }
 
 void Layout::scroll_to(const double offset)
@@ -530,12 +614,13 @@ void Layout::ensure_visible()
         return;
     }
 
-    const double top = row_top(selected_row());
-    const double bottom = top + thumb_size;
+    const size_t row = selected_row();
+    const double bottom = row_top(row) + thumb_size;
+    const double top = view_top(row);
 
     double new_target = target;
-    if (top - thumb_padding - margin_top < new_target) {
-        new_target = top - thumb_padding - margin_top;
+    if (top < new_target) {
+        new_target = top;
     } else if (bottom > new_target + window.height - margin_bottom) {
         new_target = bottom - (window.height - margin_bottom);
     }
@@ -552,8 +637,7 @@ void Layout::center_selection()
         std::max<ssize_t>(0, static_cast<ssize_t>(selected_row()) -
                                  static_cast<ssize_t>(rows / 2));
     velocity = 0;
-    target = std::clamp(row_top(first) - thumb_padding - margin_top, 0.0,
-                        max_scroll());
+    target = std::clamp(view_top(first), 0.0, max_scroll());
     scroll = target;
     rebuild();
 }
@@ -561,5 +645,87 @@ void Layout::center_selection()
 size_t Layout::selected_row() const
 {
     assert(sel_entry);
-    return sel_entry->index / columns;
+    return row_of(sel_entry->index);
+}
+
+double Layout::view_top(const size_t row) const
+{
+    double top = row_top(row) - thumb_padding - margin_top;
+    if (sections[section_of_row(row)].row == row) {
+        top -= header; // reveal section header
+    }
+    return top;
+}
+
+size_t Layout::section_of_index(const size_t index) const
+{
+    const auto it = std::upper_bound(
+        sections.begin(), sections.end(), index,
+        [](size_t idx, const Section& sec) { return idx < sec.first; });
+    return it == sections.begin() ? 0 : std::distance(sections.begin(), it) - 1;
+}
+
+size_t Layout::section_of_row(const size_t row) const
+{
+    const auto it = std::upper_bound(
+        sections.begin(), sections.end(), row,
+        [](size_t r, const Section& sec) { return r < sec.row; });
+    return it == sections.begin() ? 0 : std::distance(sections.begin(), it) - 1;
+}
+
+size_t Layout::row_of(const size_t index) const
+{
+    const Section& sec = sections[section_of_index(index)];
+    return sec.row + (index - std::min(index, sec.first)) / columns;
+}
+
+size_t Layout::col_of(const size_t index) const
+{
+    const Section& sec = sections[section_of_index(index)];
+    return (index - std::min(index, sec.first)) % columns;
+}
+
+size_t Layout::row_first(const size_t row) const
+{
+    const Section& sec = sections[section_of_row(row)];
+    return sec.first + (row - std::min(row, sec.row)) * columns;
+}
+
+size_t Layout::row_end(const size_t row) const
+{
+    const size_t sec = section_of_row(row);
+    const size_t sec_end =
+        sec + 1 < sections.size() ? sections[sec + 1].first : total;
+    return std::min(row_first(row) + columns, sec_end);
+}
+
+size_t Layout::index_at(const size_t row, const size_t col) const
+{
+    const size_t first = row_first(row);
+    const size_t end = row_end(row);
+    return end > first ? std::min(first + col, end - 1) : first;
+}
+
+ImageEntryPtr Layout::entry_at(const size_t index) const
+{
+    ImageList& il = ImageList::self();
+    const ImageEntryPtr first = il.get(nullptr, ImageList::Dir::First);
+    return first ? il.get(first, static_cast<ssize_t>(index)) : nullptr;
+}
+
+size_t Layout::rows_above(const double y, const bool strict) const
+{
+    // row tops grow monotonically: binary search
+    size_t lo = 0;
+    size_t hi = total_rows;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        const double top = row_top(mid);
+        if (strict ? top < y : top <= y) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
 }

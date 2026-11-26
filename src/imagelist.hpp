@@ -195,6 +195,13 @@ public:
     bool get_reverse() const { return reverse; }
 
     /**
+     * Get list generation: changes whenever entries are added, removed or
+     * reordered.
+     * @return generation counter
+     */
+    [[nodiscard]] uint64_t generation() const { return gen; }
+
+    /**
      * Find image entry by source path.
      * @param path path to the file or special source
      * @return image entry or nullptr if entry not found
@@ -319,6 +326,7 @@ private:
 
     Order order;  ///< Image list order
     bool reverse; ///< Reverse order flag
+    std::atomic<uint64_t> gen = 0; ///< List generation
 
     // Background loading (main thread only)
     std::thread scan_thread;                         ///< Scanner thread

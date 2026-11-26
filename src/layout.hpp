@@ -6,6 +6,9 @@
 
 #include "image.hpp"
 
+#include <functional>
+#include <vector>
+
 /**
  * Thumbnail layout.
  * All images form a virtual grid; the window shows a part of it defined by
@@ -33,8 +36,30 @@ public:
         Point pos;         ///< Window coordinates
     };
 
+    /** Section header with coordinates. */
+    struct Header {
+        ImageEntryPtr first; ///< First image of the section
+        Rectangle rect;      ///< Header area on the window
+    };
+
+    /**
+     * Section splitter: gets all entries of the image list in the list
+     * order and returns indices of the first entries of the sections
+     * (ascending, starting from 0). Empty result disables sections.
+     */
+    using Splitter =
+        std::function<std::vector<size_t>(const std::vector<ImageEntryPtr>&)>;
+
     /** Constructor. */
     Layout();
+
+    /**
+     * Group thumbnails into sections, each starts from a new row under its
+     * own header.
+     * @param fn section splitter, nullptr to disable sections
+     * @param height header height in pixels
+     */
+    void set_sections(Splitter fn, const size_t height);
 
     /**
      * Update layout: recalculate thumbnails scheme.
@@ -163,6 +188,15 @@ public:
     [[nodiscard]] const std::vector<Thumbnail>& get_scheme() const;
 
     /**
+     * Get currently visible section headers.
+     * @return array of visible headers
+     */
+    [[nodiscard]] const std::vector<Header>& get_headers() const
+    {
+        return headers;
+    }
+
+    /**
      * Enable/disable animated scrolling.
      * @param enable true to animate scrolling
      */
@@ -240,12 +274,62 @@ private:
     /** Get row of the selected image in the grid. */
     [[nodiscard]] size_t selected_row() const;
 
+    /**
+     * Get scroll offset that puts the row (with its section header, if the
+     * row starts a section) at the top of the view.
+     */
+    [[nodiscard]] double view_top(const size_t row) const;
+
+    /** Get index of the section containing the image index. */
+    [[nodiscard]] size_t section_of_index(const size_t index) const;
+
+    /** Get index of the section containing the row. */
+    [[nodiscard]] size_t section_of_row(const size_t row) const;
+
+    /** Get row of the image index. */
+    [[nodiscard]] size_t row_of(const size_t index) const;
+
+    /** Get column of the image index. */
+    [[nodiscard]] size_t col_of(const size_t index) const;
+
+    /** Get index of the first image in the row. */
+    [[nodiscard]] size_t row_first(const size_t row) const;
+
+    /** Get index past the last image in the row. */
+    [[nodiscard]] size_t row_end(const size_t row) const;
+
+    /** Get index of the image in the row, nearest to the column. */
+    [[nodiscard]] size_t index_at(const size_t row, const size_t col) const;
+
+    /** Get image entry by index. */
+    [[nodiscard]] ImageEntryPtr entry_at(const size_t index) const;
+
+    /**
+     * Get number of rows with top coordinate (grid space) less than or
+     * equal to y (or strictly less if `strict` is set).
+     */
+    [[nodiscard]] size_t rows_above(const double y, const bool strict) const;
+
 private:
     size_t thumb_size;             ///< Size of thumbnail in pixels
     size_t thumb_padding;          ///< Padding between thumbnails in pixels
     size_t margin_top = 0;         ///< Top inset (overlay header)
     size_t margin_bottom = 0;      ///< Bottom inset (floating controls)
     std::vector<Thumbnail> scheme; ///< Layout scheme of visible thumbnails
+    std::vector<Header> headers;   ///< Visible section headers
+
+    /** Section of the grid. */
+    struct Section {
+        size_t first; ///< Index of the first image
+        size_t row;   ///< First row of the section
+    };
+    Splitter splitter;               ///< Section splitter
+    size_t header_size = 0;          ///< Configured header height
+    size_t header = 0;               ///< Effective header height
+    std::vector<size_t> starts;      ///< Section starts from the splitter
+    uint64_t list_gen = 0;           ///< Image list generation of starts
+    bool starts_valid = false;       ///< Section starts are up to date
+    std::vector<Section> sections = { { 0, 0 } }; ///< Grid sections
 
     Size window;          ///< Layout size (output window)
     size_t columns = 1;   ///< Number of columns

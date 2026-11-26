@@ -281,6 +281,15 @@ void Gallery::set_margins(const size_t top, const size_t bottom)
     }
 }
 
+void Gallery::set_sections(Layout::Splitter fn, const size_t height)
+{
+    layout.set_sections(std::move(fn), height);
+    if (is_active()) {
+        refresh();
+        Application::redraw();
+    }
+}
+
 void Gallery::drop_cache()
 {
     tpool.cancel();
@@ -380,6 +389,12 @@ void Gallery::window_redraw(Canvas& wnd)
     }
 
     wnd.fill({ 0, 0, wnd.size().width, wnd.size().height }, clr_window);
+
+    if (section_overlay) {
+        for (const auto& it : layout.get_headers()) {
+            section_overlay(wnd, it.first, it.rect);
+        }
+    }
 
     // draw all exclude the currently and previously selected (on top)
     const auto& scheme = layout.get_scheme();

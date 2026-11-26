@@ -368,6 +368,10 @@ private:
     /** Show folder chooser and add selected folders as albums. */
     void add_folders();
 
+    /** Draw date section header in photo views. */
+    void draw_section(Canvas& wnd, const ImageEntryPtr& entry,
+                      const Rectangle& rect);
+
     /** Draw caption on album tile in the Albums view. */
     void draw_caption(Canvas& wnd, const ImageEntryPtr& entry,
                       const Rectangle& tile, const double opacity);
@@ -426,4 +430,5 @@ private:
     double menu_anim = 0;              ///< Filter menu appearance progress
     size_t margin_top = 0;             ///< Gallery top inset
     size_t margin_bottom = 0;          ///< Gallery bottom inset
+    size_t section_height = 0;         ///< Gallery section header height
 };
