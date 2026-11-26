@@ -195,6 +195,18 @@ public:
     bool get_reverse() const { return reverse; }
 
     /**
+     * Check if directory is hidden (name starts with a dot): such
+     * directories are skipped when loading nested folders.
+     * @param path directory path
+     * @return true if directory is hidden
+     */
+    static bool is_hidden(const std::filesystem::path& path)
+    {
+        const std::string name = path.filename().string();
+        return name.size() > 1 && name[0] == '.' && name != "..";
+    }
+
+    /**
      * Get list generation: changes whenever entries are added, removed or
      * reordered.
      * @return generation counter

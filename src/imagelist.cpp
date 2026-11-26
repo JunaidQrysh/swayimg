@@ -459,7 +459,7 @@ private:
             std::filesystem::path child = it->path();
             std::error_code child_ec;
             if (std::filesystem::is_directory(child, child_ec)) {
-                if (recursive) {
+                if (recursive && !ImageList::is_hidden(child)) {
                     subdirs.push_back(std::move(child));
                 }
             } else if (child_ec) {
@@ -1202,7 +1202,7 @@ ImageList::EntriesArray ImageList::add_dir(const std::filesystem::path& path)
         const std::filesystem::path child_path = it->path();
         std::error_code child_ec;
         if (std::filesystem::is_directory(child_path, child_ec)) {
-            if (recursive) {
+            if (recursive && !is_hidden(child_path)) {
                 EntriesArray entries = add_dir(child_path);
                 added.reserve(added.size() + entries.size());
                 added.insert(added.end(), entries.begin(), entries.end());

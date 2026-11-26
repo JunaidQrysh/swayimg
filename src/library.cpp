@@ -598,6 +598,12 @@ void Library::show_albums(const std::filesystem::path& select)
             std::filesystem::recursive_directory_iterator dit(it.path, opts,
                                                               ec);
             for (; !ec && dit != std::filesystem::end(dit); dit.increment(ec)) {
+                std::error_code dir_ec;
+                if (dit->is_directory(dir_ec) &&
+                    ImageList::is_hidden(dit->path())) {
+                    dit.disable_recursion_pending(); // skip hidden folders
+                    continue;
+                }
                 check(*dit);
             }
         } else {

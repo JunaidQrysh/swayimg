@@ -913,7 +913,7 @@ void Application::handle_event(const AppEvent::FileCreate& event)
     if (!is_dir && il.file_filter && !il.file_filter(event.path)) {
         return; // not a media file
     }
-    if (!is_dir || il.recursive) {
+    if (!is_dir || (il.recursive && !ImageList::is_hidden(event.path))) {
         // Temporarily disable `adjacent` to prevent adding unnecessary files.
         const bool adjacent = il.adjacent;
         il.adjacent = false;
