@@ -252,6 +252,7 @@ protected:
     void handle_scroll_stop() override;
     void handle_imagelist(const ImageListEvent event,
                           const std::vector<ImageEntryPtr>& entries) override;
+    void invalidate(const std::vector<ImageEntryPtr>& entries) override;
 
 private:
     /**

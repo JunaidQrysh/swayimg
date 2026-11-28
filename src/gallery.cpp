@@ -452,17 +452,22 @@ void Gallery::handle_pinch(const double scale_delta, const double /*dx*/,
     set_thumb_size(get_thumb_size() + size_delta);
 }
 
+void Gallery::invalidate(const std::vector<ImageEntryPtr>& entries)
+{
+    // remove entry from cache
+    const std::scoped_lock lock(mutex);
+    for (const auto& entry : entries) {
+        thumbs.erase(entry);
+    }
+}
+
 void Gallery::handle_imagelist(const ImageListEvent event,
                                const std::vector<ImageEntryPtr>& entries)
 {
     AppMode::handle_imagelist(event, entries);
 
     if (event == ImageListEvent::Modify || event == ImageListEvent::Remove) {
-        // remove entry from cache
-        const std::scoped_lock lock(mutex);
-        for (const auto& entry : entries) {
-            thumbs.erase(entry);
-        }
+        invalidate(entries);
     }
 
     if (event == ImageListEvent::Create) {

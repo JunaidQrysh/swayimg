@@ -30,6 +30,9 @@
 
 namespace {
 
+/** Format name of the video placeholder taken from the thumbnail cache. */
+constexpr const char* VIDEO_POSTER = "Video";
+
 // Duration of zoom/pan transition in seconds
 constexpr double VIEW_ANIM_TIME = 0.2;
 // Duration of gallery<->viewer transition in seconds
@@ -490,6 +493,12 @@ void Viewer::activate(const ImageEntryPtr& entry, const Size& wnd)
 
     window_size = wnd;
 
+    if (image && image->format == VIDEO_POSTER) {
+        // video poster is not reused: thumbnail may have been regenerated
+        // while the viewer was inactive, it is cheap to get it again
+        image = nullptr;
+    }
+
     if (entry && image && image->entry == entry && !entry->removed) {
         set_image(image); // reinit state without reloading image
         if (this == &Viewer::self() && VideoPlayer::is_video(entry)) {
@@ -553,7 +562,7 @@ bool Viewer::set_current(const ImageEntryPtr& entry)
             new_image = std::make_shared<Image>();
             new_image->frames.resize(1);
             new_image->frames[0].pm = std::move(thumb);
-            new_image->format = "Video";
+            new_image->format = VIDEO_POSTER;
             new_image->entry = entry;
         }
     }
@@ -1199,18 +1208,34 @@ void Viewer::stop_pan()
     pan_ry = 0;
 }
 
-void Viewer::handle_imagelist(const ImageListEvent event,
-                              const std::vector<ImageEntryPtr>& entries)
+void Viewer::invalidate(const std::vector<ImageEntryPtr>& entries)
 {
-    AppMode::handle_imagelist(event, entries);
-
-    if (event == ImageListEvent::Modify || event == ImageListEvent::Remove) {
+    {
         // remove entries from cache
         const std::scoped_lock lock(image_pool.mutex);
         for (const auto& entry : entries) {
             image_pool.history.get(entry);
             image_pool.preload.get(entry);
         }
+    }
+
+    // inactive mode keeps its last image to reopen it without reloading:
+    // drop it if outdated (the active mode reloads it in handle_imagelist)
+    if (!is_active() && image &&
+        std::ranges::find(entries, image->entry) != entries.end()) {
+        image = nullptr;
+        placeholder.image = nullptr;
+        placeholder.full = nullptr;
+    }
+}
+
+void Viewer::handle_imagelist(const ImageListEvent event,
+                              const std::vector<ImageEntryPtr>& entries)
+{
+    AppMode::handle_imagelist(event, entries);
+
+    if (event == ImageListEvent::Modify || event == ImageListEvent::Remove) {
+        invalidate(entries);
     }
 
     switch (event) {
@@ -1241,8 +1266,9 @@ void Viewer::handle_imagelist(const ImageListEvent event,
 
 void Viewer::set_image(const ImagePtr& img)
 {
-    if (image && image != img && !is_placeholder()) {
-        // put current image to history
+    if (image && image != img && !is_placeholder() &&
+        image->format != VIDEO_POSTER) {
+        // put current image to history (video posters have own cache)
         const std::scoped_lock lock(image_pool.mutex);
         image_pool.history.put(image);
     }

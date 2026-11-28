@@ -174,6 +174,12 @@ public:
                                   const std::vector<ImageEntryPtr>& entries);
 
     /**
+     * Drop cached data of modified files, called for inactive modes too.
+     * @param entries array of modified image entries
+     */
+    virtual void invalidate(const std::vector<ImageEntryPtr>& /*entries*/) {}
+
+    /**
      * Check if current mode is active.
      * @return true if current mode is active
      */

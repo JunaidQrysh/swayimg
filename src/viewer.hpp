@@ -251,6 +251,7 @@ public:
                         const Point& pos) override;
     void handle_imagelist(const ImageListEvent event,
                           const std::vector<ImageEntryPtr>& entries) override;
+    void invalidate(const std::vector<ImageEntryPtr>& entries) override;
     bool animate(const double dt) override;
 
     /**

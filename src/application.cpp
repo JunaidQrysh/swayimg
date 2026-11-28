@@ -929,6 +929,14 @@ void Application::handle_event(const AppEvent::FileModify& event)
         ImageList& il = ImageList::self();
         const ImageEntryPtr entry = il.find(event.path);
         if (entry) {
+            // inactive modes keep cached data of the file too
+            AppMode* const modes[] = { &Viewer::self(), &Slideshow::self(),
+                                       &Gallery::self() };
+            for (AppMode* mode : modes) {
+                if (mode != current_mode()) {
+                    mode->invalidate({ entry });
+                }
+            }
             current_mode()->handle_imagelist(AppMode::ImageListEvent::Modify,
                                              { entry });
         } else {
