@@ -182,6 +182,16 @@ public:
      */
     void set_order(const Order new_order);
 
+    /** Custom order: true if left entry goes first. */
+    using Comparator =
+        std::function<bool(const ImageEntry& l, const ImageEntry& r)>;
+
+    /**
+     * Set custom order (overrides order and reverse mode) and sort the list.
+     * @param cmp comparator, nullptr to use the standard order
+     */
+    void set_comparator(Comparator cmp);
+
     /**
      * Enable/disable reverse order.
      * @param enable state to set
@@ -338,6 +348,7 @@ private:
 
     Order order;  ///< Image list order
     bool reverse; ///< Reverse order flag
+    Comparator comparator; ///< Custom order
     std::atomic<uint64_t> gen = 0; ///< List generation
 
     // Background loading (main thread only)

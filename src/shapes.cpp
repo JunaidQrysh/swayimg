@@ -75,6 +75,28 @@ std::vector<Prim> icon_prims(const Shapes::Icon icon)
                      { Prim::Line, 0.66, 0.44, 0.90, 0.30, 0 },
                      { Prim::Line, 0.90, 0.30, 0.90, 0.70, 0 },
                      { Prim::Line, 0.90, 0.70, 0.66, 0.56, 0 } };
+        case Sort:
+            return { { Prim::Line, 0.32, 0.82, 0.32, 0.18, 0 },
+                     { Prim::Line, 0.16, 0.34, 0.32, 0.18, 0 },
+                     { Prim::Line, 0.32, 0.18, 0.48, 0.34, 0 },
+                     { Prim::Line, 0.68, 0.18, 0.68, 0.82, 0 },
+                     { Prim::Line, 0.52, 0.66, 0.68, 0.82, 0 },
+                     { Prim::Line, 0.68, 0.82, 0.84, 0.66, 0 } };
+        case Clock:
+            return { { Prim::Frame, 0.12, 0.12, 0.88, 0.88, 0.38 },
+                     { Prim::Line, 0.50, 0.50, 0.50, 0.28, 0 },
+                     { Prim::Line, 0.50, 0.50, 0.66, 0.60, 0 } };
+        case Alpha:
+            return { { Prim::Line, 0.10, 0.82, 0.29, 0.18, 0 },
+                     { Prim::Line, 0.29, 0.18, 0.48, 0.82, 0 },
+                     { Prim::Line, 0.17, 0.60, 0.41, 0.60, 0 },
+                     { Prim::Line, 0.74, 0.18, 0.74, 0.82, 0 },
+                     { Prim::Line, 0.60, 0.68, 0.74, 0.82, 0 },
+                     { Prim::Line, 0.74, 0.82, 0.88, 0.68, 0 } };
+        case Stack:
+            return { { Prim::Frame, 0.12, 0.32, 0.70, 0.88, 0.08 },
+                     { Prim::Line, 0.28, 0.16, 0.86, 0.16, 0 },
+                     { Prim::Line, 0.86, 0.16, 0.86, 0.72, 0 } };
     }
     return {};
 }

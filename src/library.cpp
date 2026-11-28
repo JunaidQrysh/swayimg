@@ -19,6 +19,7 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <map>
 #include <thread>
 #include <unordered_set>
 
@@ -54,6 +55,7 @@ constexpr argb_t CLR_ACCENT = { 0xff, 0x8a, 0xb4, 0xf8 };
 constexpr argb_t CLR_ACCENT_TEXT = { 0xff, 0x0e, 0x1f, 0x3a };
 constexpr argb_t CLR_MENU = { 0xf5, 0x2c, 0x2c, 0x2f };
 constexpr argb_t CLR_SEPARATOR = { 0x28, 0xff, 0xff, 0xff };
+constexpr argb_t CLR_HOVER = { 0x1f, 0xff, 0xff, 0xff };
 
 // Highlight slide speed
 constexpr double HIGHLIGHT_SPEED = 18.0;
@@ -215,8 +217,12 @@ std::pair<uintmax_t, int64_t> file_stamp(const std::filesystem::path& path)
     return { size, static_cast<int64_t>(mtime.time_since_epoch().count()) };
 }
 
-/** Get path of the config file with saved albums. */
-std::filesystem::path config_file()
+/**
+ * Get path of the library config file.
+ * @param name file name: "albums" (saved albums) or "sources" (folders to
+ *             search for albums)
+ */
+std::filesystem::path config_file(const char* name = "albums")
 {
     std::filesystem::path dir;
     const char* xdg = std::getenv("XDG_CONFIG_HOME");
@@ -229,7 +235,7 @@ std::filesystem::path config_file()
         }
         dir = std::filesystem::path(home) / ".config";
     }
-    return dir / "swayimg" / "albums";
+    return dir / "swayimg" / name;
 }
 
 /** Convert UTF-8 to wide string. */
@@ -401,6 +407,7 @@ Library& Library::self()
 void Library::startup(StartupParams& params)
 {
     load();
+    load_sources();
     load_bad();
 
     Application::self().add_fdpoll(toast_timer, [this] {
@@ -424,6 +431,7 @@ void Library::startup(StartupParams& params)
     if (sources.empty()) {
         // started without arguments: Photos view (see photo_sources)
         view = View::Photos;
+        start_discovery(); // ready by the time Albums is opened
         if (!params.mode.is_locked()) {
             params.mode = AppMode::Gallery;
         }
@@ -449,6 +457,7 @@ void Library::startup(StartupParams& params)
                                                      : first.parent_path();
     view = View::Album;
     adjacent_start = !all_dirs;
+    start_discovery();
     if (all_dirs && !params.mode.is_locked()) {
         params.mode = AppMode::Gallery;
     }
@@ -557,6 +566,95 @@ void Library::set_filter(const Filter new_filter)
     }
 }
 
+namespace {
+/** Album order names in the config file. */
+constexpr std::pair<Library::AlbumSort, std::string_view> SORT_NAMES[] = {
+    { Library::AlbumSort::Recent,      "recent"    },
+    { Library::AlbumSort::Oldest,      "oldest"    },
+    { Library::AlbumSort::NameAsc,     "name"      },
+    { Library::AlbumSort::NameDesc,    "name-desc" },
+    { Library::AlbumSort::MostItems,   "most"      },
+    { Library::AlbumSort::FewestItems, "fewest"    },
+};
+
+/** Compare strings ignoring case. */
+int compare_nocase(const std::string& l, const std::string& r)
+{
+    const size_t len = std::min(l.size(), r.size());
+    for (size_t i = 0; i < len; ++i) {
+        const int lc = std::tolower(static_cast<unsigned char>(l[i]));
+        const int rc = std::tolower(static_cast<unsigned char>(r[i]));
+        if (lc != rc) {
+            return lc < rc ? -1 : 1;
+        }
+    }
+    return l.size() == r.size() ? 0 : (l.size() < r.size() ? -1 : 1);
+}
+} // namespace
+
+ImageList::Comparator Library::album_comparator() const
+{
+    // called on the main thread while the list is sorted
+    return [this](const ImageEntry& l, const ImageEntry& r) {
+        const auto album_of = [this](const ImageEntry& entry) {
+            const auto it = cover_album.find(entry.path);
+            return it == cover_album.end() ? entry.path : it->second;
+        };
+        const auto count_of = [this](const std::filesystem::path& dir) {
+            const auto it = album_info.find(dir);
+            return it == album_info.end() ? 0 : it->second.count;
+        };
+        const std::filesystem::path ldir = album_of(l);
+        const std::filesystem::path rdir = album_of(r);
+
+        int cmp = 0;
+        switch (album_sort) {
+            case AlbumSort::Recent:
+                cmp = l.mtime == r.mtime ? 0 : (l.mtime > r.mtime ? -1 : 1);
+                break;
+            case AlbumSort::Oldest:
+                cmp = l.mtime == r.mtime ? 0 : (l.mtime < r.mtime ? -1 : 1);
+                break;
+            case AlbumSort::NameAsc:
+            case AlbumSort::NameDesc:
+                cmp = compare_nocase(ldir.filename().string(),
+                                     rdir.filename().string());
+                if (album_sort == AlbumSort::NameDesc) {
+                    cmp = -cmp;
+                }
+                break;
+            case AlbumSort::MostItems:
+            case AlbumSort::FewestItems: {
+                const size_t lc = count_of(ldir);
+                const size_t rc = count_of(rdir);
+                cmp = lc == rc ? 0 : (lc > rc ? -1 : 1);
+                if (album_sort == AlbumSort::FewestItems) {
+                    cmp = -cmp;
+                }
+                break;
+            }
+        }
+        if (cmp == 0) {
+            // same key: by name, then by full path
+            cmp = compare_nocase(ldir.filename().string(),
+                                 rdir.filename().string());
+        }
+        return cmp == 0 ? ldir < rdir : cmp < 0;
+    };
+}
+
+void Library::set_album_sort(const AlbumSort order)
+{
+    if (album_sort == order) {
+        return;
+    }
+    album_sort = order;
+    save();
+    if (view == View::Albums) {
+        show_albums(); // re-sort, scroll to the top
+    }
+}
+
 void Library::show_photos()
 {
     set_view(View::Photos, photo_sources(), ImageList::self().fsmon);
@@ -653,6 +751,19 @@ void Library::show_albums(const std::filesystem::path& select)
         album_info.insert_or_assign(it.path, info);
     }
 
+    // folders found in the home directory (last scan, refreshed below)
+    for (const auto& [path, info] : discovered) {
+        if (album_info.contains(path) || is_bad(info.cover)) {
+            continue; // saved album
+        }
+        covers.push_back(info.cover);
+        cover_album.insert_or_assign(info.cover, path);
+        if (path == select) {
+            select_cover = info.cover;
+        }
+        album_info.insert_or_assign(path, info);
+    }
+
     set_view(
         View::Albums,
         [covers, empty](ImageList& il) {
@@ -664,6 +775,159 @@ void Library::show_albums(const std::filesystem::path& select)
             }
         },
         select_cover, false);
+
+    start_discovery();
+}
+
+void Library::start_discovery()
+{
+    if (discovering) {
+        rediscover = true;
+        return;
+    }
+    if (sources.empty()) {
+        apply_discovered({});
+        return;
+    }
+    discovering = true;
+    rediscover = false;
+
+    std::thread([roots = sources, bad = bad_files] {
+        const Log::PerfTimer timer;
+
+        // media files grouped by folder: mtime and path
+        std::map<std::filesystem::path,
+                 std::vector<std::pair<std::filesystem::file_time_type,
+                                       std::filesystem::path>>>
+            dirs;
+        for (const std::filesystem::path& root : roots) {
+            std::error_code ec;
+            std::filesystem::recursive_directory_iterator dit(
+                root, std::filesystem::directory_options::skip_permission_denied,
+                ec);
+            for (; !ec && dit != std::filesystem::end(dit); dit.increment(ec)) {
+                const std::filesystem::path& path = dit->path();
+                std::error_code de_ec;
+                if (dit->is_directory(de_ec)) {
+                    if (ImageList::is_hidden(path)) {
+                        dit.disable_recursion_pending(); // skip hidden folders
+                    }
+                    continue;
+                }
+                if (!is_media(path) || !dit->is_regular_file(de_ec)) {
+                    continue;
+                }
+                const auto it = bad.find(path);
+                if (it != bad.end() && it->second == file_stamp(path)) {
+                    continue; // known broken file
+                }
+                const auto mtime = dit->last_write_time(de_ec);
+                dirs[path.parent_path()].emplace_back(
+                    de_ec ? std::filesystem::file_time_type {} : mtime, path);
+            }
+        }
+
+        // cover: the newest file that looks like a real image
+        Discovered found;
+        std::vector<std::filesystem::path> broken;
+        for (auto& [dir, files] : dirs) {
+            std::ranges::sort(files);
+            files.erase(std::ranges::unique(files).begin(), files.end());
+            std::ranges::sort(files, [](const auto& l, const auto& r) {
+                return l.first > r.first;
+            });
+            AlbumInfo info;
+            info.count = files.size();
+            for (const auto& [mtime, path] : files) {
+                if (sniff_media(path)) {
+                    info.cover = path.lexically_normal();
+                    break;
+                }
+                broken.push_back(path);
+                --info.count;
+            }
+            if (!info.cover.empty()) {
+                found.emplace_back(dir, std::move(info));
+            }
+        }
+
+        Log::verbose("Found {} albums in {} folders in {:.3f} sec",
+                     found.size(), roots.size(), timer.time());
+
+        Application::self().add_event(AppEvent::Callback {
+            [found = std::move(found), broken = std::move(broken)]() mutable {
+                Library& lib = Library::self();
+                lib.mark_bad(broken);
+                lib.apply_discovered(std::move(found));
+            } });
+    }).detach();
+}
+
+void Library::apply_discovered(Discovered found)
+{
+    discovering = false;
+    discovered = std::move(found);
+    if (rediscover) {
+        start_discovery(); // sources changed during the scan
+    }
+    if (view != View::Albums) {
+        return; // used on the next show_albums()
+    }
+
+    // update the grid in place: keep scroll position and selection
+    PathMap<const AlbumInfo*> fresh;
+    for (const auto& [path, info] : discovered) {
+        if (!find(path)) {
+            fresh.insert_or_assign(path, &info);
+        }
+    }
+
+    std::vector<std::filesystem::path> removed;
+    std::vector<std::filesystem::path> added;
+    for (auto it = album_info.begin(); it != album_info.end();) {
+        const auto& [path, info] = *it;
+        if (find(path)) {
+            ++it; // saved album
+            continue;
+        }
+        const auto fit = fresh.find(path);
+        if (fit != fresh.end() && fit->second->cover == info.cover) {
+            it->second.count = fit->second->count;
+            fresh.erase(fit); // unchanged
+            ++it;
+            continue;
+        }
+        removed.push_back(info.cover); // gone or new cover
+        cover_album.erase(info.cover);
+        it = album_info.erase(it);
+    }
+    for (const auto& [path, info] : fresh) {
+        added.push_back(info->cover);
+        cover_album.insert_or_assign(info->cover, path);
+        album_info.insert_or_assign(path, *info);
+    }
+
+    Application& app = Application::self();
+    AppMode* mode = app.current_mode();
+    ImageList& il = ImageList::self();
+    const bool at_top = mode &&
+        mode->get_current() == il.get(nullptr, ImageList::Dir::First);
+
+    if (!removed.empty()) {
+        app.remove_images(removed);
+    }
+    if (!added.empty()) {
+        app.add_images(added);
+    }
+
+    // keep the top of the grid selected while albums appear
+    if (at_top && app.get_mode() == AppMode::Gallery) {
+        const ImageEntryPtr first = il.get(nullptr, ImageList::Dir::First);
+        if (first && first != mode->get_current()) {
+            mode->set_current(first);
+        }
+    }
+    Application::redraw();
 }
 
 void Library::open_album(const std::filesystem::path& dir)
@@ -760,6 +1024,16 @@ void Library::load()
 
     std::string line;
     while (std::getline(file, line)) {
+        // "sort <order>": order of the Albums grid
+        if (line.starts_with("sort ")) {
+            const std::string_view name = std::string_view(line).substr(5);
+            for (const auto& [value, id] : SORT_NAMES) {
+                if (id == name) {
+                    album_sort = value;
+                }
+            }
+            continue;
+        }
         // "<+|-><flags> <path>", flags: r - include subfolders
         const size_t space = line.find(' ');
         if (line.empty() || (line[0] != '+' && line[0] != '-') ||
@@ -774,6 +1048,75 @@ void Library::load()
             albums.push_back(it);
         }
     }
+}
+
+void Library::load_sources()
+{
+    sources.clear();
+    std::ifstream file(config_file("sources"));
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        const std::filesystem::path path = normalize(line);
+        if (std::ranges::find(sources, path) == sources.end()) {
+            sources.push_back(path);
+        }
+    }
+}
+
+void Library::save_sources() const
+{
+    const std::filesystem::path path = config_file("sources");
+    if (path.empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::filesystem::path tmp = path;
+    tmp += ".tmp";
+    {
+        std::ofstream file(tmp, std::ios::trunc);
+        if (!file.is_open()) {
+            Log::error("Unable to save scan folders to {}", path.string());
+            return;
+        }
+        file << "# swayimg: folders searched for albums, every subfolder "
+                "with photos or videos is shown as an album\n";
+        for (const auto& it : sources) {
+            file << it.string() << '\n';
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        Log::error("Unable to save scan folders to {}: {}", path.string(),
+                   ec.message());
+    }
+}
+
+void Library::add_sources()
+{
+    FolderPicker::pick(
+        "Folders to search for albums",
+        [this](const std::vector<std::filesystem::path>& paths) {
+            size_t added = 0;
+            for (const auto& it : paths) {
+                std::error_code ec;
+                const std::filesystem::path path = normalize(it);
+                if (std::filesystem::is_directory(path, ec) &&
+                    std::ranges::find(sources, path) == sources.end()) {
+                    sources.push_back(path);
+                    ++added;
+                }
+            }
+            if (added) {
+                save_sources();
+                start_discovery();
+                toast(std::format("Searching {} {} for albums", added,
+                                  added == 1 ? "folder" : "folders"));
+            }
+        });
 }
 
 void Library::save() const
@@ -796,6 +1139,11 @@ void Library::save() const
         }
         file << "# swayimg albums: '+' shown in Photos, '-' hidden, "
                 "'r' includes subfolders\n";
+        for (const auto& [value, id] : SORT_NAMES) {
+            if (value == album_sort) {
+                file << "sort " << id << '\n';
+            }
+        }
         for (const Album& it : albums) {
             file << (it.in_photos ? '+' : '-') << (it.recursive ? "r" : "")
                  << ' ' << it.path.string() << '\n';
@@ -845,7 +1193,13 @@ void Library::set_view(const View new_view,
 
 void Library::prepare_view(const View new_view)
 {
+    if (view != new_view) {
+        menu_open = false; // menus are view specific
+        menu_anim = 0;
+    }
     view = new_view;
+    ImageList::self().set_comparator(
+        view == View::Albums ? album_comparator() : nullptr);
 
     Gallery& gallery = Gallery::self();
     if (view == View::Albums) {
@@ -955,7 +1309,8 @@ void Library::draw(Canvas& wnd, const double opacity)
     }
 
     // hint for empty views (not while the list is still loading)
-    if (ImageList::self().size() == 0 && !ImageList::self().scanning()) {
+    if (ImageList::self().size() == 0 && !ImageList::self().scanning() &&
+        !(view == View::Albums && discovering)) {
         std::string hint;
         if (filter != Filter::All && view != View::Albums) {
             hint = filter == Filter::Videos ? "No videos here"
@@ -965,8 +1320,9 @@ void Library::draw(Canvas& wnd, const double opacity)
                 ? "No albums yet: add folders in Albums"
                 : "No photos: show some albums in Photos";
         } else if (view == View::Albums) {
-            hint = albums.empty() ? "No albums yet: add a folder to get started"
-                                  : "Saved albums have no images";
+            hint = sources.empty() && albums.empty()
+                ? "No albums yet: add a folder or scan folders for albums"
+                : "No folders with photos or videos found";
         } else {
             hint = album_recursive(album)
                 ? "No images in this folder and its subfolders"
@@ -981,20 +1337,26 @@ void Library::draw(Canvas& wnd, const double opacity)
                   fade(CLR_TEXT_DIM, opacity));
     }
 
+    // menu button: album order in Albums view, media filter otherwise
     const Rectangle switcher = draw_switcher(wnd, opacity);
-    if (view == View::Albums) {
-        menu_open = false; // filter applies to photos only
-        menu_anim = 0;
+    const bool albums_view = view == View::Albums;
+    const Rectangle button = albums_view
+        ? draw_menu_button(wnd, switcher, Shapes::Icon::Sort,
+                           album_sort != AlbumSort::Recent, opacity)
+        : draw_menu_button(wnd, switcher, Shapes::Icon::Filter,
+                           filter != Filter::All, opacity);
+    if (menu_anim > 0) {
+        draw_menu(wnd, button, albums_view ? sort_menu() : filter_menu(),
+                  opacity * menu_anim);
     } else {
-        const Rectangle button = draw_filter_button(wnd, switcher, opacity);
-        if (menu_anim > 0) {
-            draw_filter_menu(wnd, button, opacity * menu_anim);
-        }
+        menu_rect = {};
     }
+    update_hover(); // controls may have moved: update the cursor
 }
 
-Rectangle Library::draw_filter_button(Canvas& wnd, const Rectangle& switcher,
-                                      const double opacity)
+Rectangle Library::draw_menu_button(Canvas& wnd, const Rectangle& switcher,
+                                    const Shapes::Icon icon_type,
+                                    const bool active, const double opacity)
 {
     const size_t size = switcher.height;
     const Rectangle rect { switcher.x + static_cast<ssize_t>(switcher.width) +
@@ -1002,19 +1364,21 @@ Rectangle Library::draw_filter_button(Canvas& wnd, const Rectangle& switcher,
                            switcher.y, size, size };
     wnd.mask(pill({ size, size }), { rect.x, rect.y },
              fade(menu_open ? CLR_HIGHLIGHT : CLR_PANEL, opacity));
+    if (hot(rect)) {
+        draw_hover(wnd, rect, size / 2, opacity);
+    }
     const size_t icon = dp(22);
-    wnd.mask(Shapes::icon(Shapes::Icon::Filter, icon),
+    wnd.mask(Shapes::icon(icon_type, icon),
              { rect.x + static_cast<ssize_t>(size / 2 - icon / 2),
                rect.y + static_cast<ssize_t>(size / 2 - icon / 2) },
-             fade(filter == Filter::All ? CLR_TEXT : CLR_ACCENT, opacity));
+             fade(active ? CLR_ACCENT : CLR_TEXT, opacity));
     hits.push_back({ rect, [this] {
                         menu_open = !menu_open;
                     } });
     return rect;
 }
 
-void Library::draw_filter_menu(Canvas& wnd, const Rectangle& button,
-                               const double opacity)
+std::vector<Library::MenuItem> Library::filter_menu()
 {
     struct Item {
         Filter value;
@@ -1026,8 +1390,47 @@ void Library::draw_filter_menu(Canvas& wnd, const Rectangle& button,
         { Filter::Photos, Shapes::Icon::Photo, L"Photos" },
         { Filter::Videos, Shapes::Icon::Video, L"Videos" },
     };
-    constexpr size_t count = sizeof(items) / sizeof(items[0]);
+    std::vector<MenuItem> menu;
+    for (const Item& it : items) {
+        const Filter value = it.value;
+        menu.push_back({ it.icon, it.label, value == filter, [this, value] {
+                            set_filter(value);
+                        } });
+    }
+    return menu;
+}
 
+std::vector<Library::MenuItem> Library::sort_menu()
+{
+    struct Item {
+        AlbumSort value;
+        Shapes::Icon icon;
+        const wchar_t* label;
+    };
+    static constexpr Item items[] = {
+        { AlbumSort::Recent,      Shapes::Icon::Clock, L"Recent photos" },
+        { AlbumSort::Oldest,      Shapes::Icon::Clock, L"Oldest photos" },
+        { AlbumSort::NameAsc,     Shapes::Icon::Alpha, L"Name A–Z"      },
+        { AlbumSort::NameDesc,    Shapes::Icon::Alpha, L"Name Z–A"      },
+        { AlbumSort::MostItems,   Shapes::Icon::Stack, L"Most items"    },
+        { AlbumSort::FewestItems, Shapes::Icon::Stack, L"Fewest items"  },
+    };
+    std::vector<MenuItem> menu;
+    for (const Item& it : items) {
+        const AlbumSort value = it.value;
+        menu.push_back({ it.icon, it.label, value == album_sort,
+                         [this, value] {
+                             set_album_sort(value);
+                         } });
+    }
+    return menu;
+}
+
+void Library::draw_menu(Canvas& wnd, const Rectangle& button,
+                        const std::vector<MenuItem>& items,
+                        const double opacity)
+{
+    const size_t count = items.size();
     const size_t width = dp(MENU_WIDTH);
     const size_t item_h = dp(MENU_ITEM);
     const size_t pad = dp(MENU_PAD);
@@ -1045,28 +1448,45 @@ void Library::draw_filter_menu(Canvas& wnd, const Rectangle& button,
 
     const size_t icon = dp(MENU_ICON);
     const ssize_t th = text_height(*font_title);
+
+    // hovered item: its separators are hidden
+    ssize_t hovered = -1;
+    for (size_t i = 0; i < count; ++i) {
+        if (hot({ panel.x, panel.y + static_cast<ssize_t>(pad + i * item_h),
+                  width, item_h },
+                true)) {
+            hovered = static_cast<ssize_t>(i);
+        }
+    }
+
     std::vector<HitArea> menu_hits;
     for (size_t i = 0; i < count; ++i) {
-        const Item& item = items[i];
-        const bool selected = item.value == filter;
-        const argb_t color = selected ? CLR_ACCENT : CLR_TEXT;
+        const MenuItem& item = items[i];
+        const argb_t color = item.selected ? CLR_ACCENT : CLR_TEXT;
         const ssize_t y = panel.y + pad + i * item_h;
         const ssize_t cy = y + static_cast<ssize_t>(item_h / 2);
         const ssize_t text_x = panel.x + dp(60);
 
+        if (static_cast<ssize_t>(i) == hovered) {
+            draw_hover(wnd, { panel.x + static_cast<ssize_t>(pad) / 2, y,
+                              width - pad, item_h },
+                       dp(16), opacity);
+        }
         wnd.mask(Shapes::icon(item.icon, icon),
                  { panel.x + dp(20), cy - static_cast<ssize_t>(icon / 2) },
                  fade(color, opacity));
         draw_text(wnd, *font_title, item.label, { text_x, cy - th / 2 },
                   fade(color, opacity));
-        if (selected) {
+        if (item.selected) {
             wnd.mask(Shapes::icon(Shapes::Icon::Check, icon),
                      { panel.x + static_cast<ssize_t>(width) - dp(20) -
                            static_cast<ssize_t>(icon),
                        cy - static_cast<ssize_t>(icon / 2) },
                      fade(CLR_ACCENT, opacity));
         }
-        if (i + 1 < count) {
+        const bool near_hover = static_cast<ssize_t>(i) == hovered ||
+            static_cast<ssize_t>(i + 1) == hovered;
+        if (i + 1 < count && !near_hover) {
             wnd.fill_blend({ text_x, y + static_cast<ssize_t>(item_h),
                              static_cast<size_t>(panel.x + width - dp(16) -
                                                  text_x),
@@ -1074,14 +1494,15 @@ void Library::draw_filter_menu(Canvas& wnd, const Rectangle& button,
                            fade(CLR_SEPARATOR, opacity));
         }
 
-        const Filter value = item.value;
-        menu_hits.push_back({ { panel.x, y, width, item_h }, [this, value] {
-                                 menu_open = false;
-                                 set_filter(value);
-                             } });
+        menu_hits.push_back({ { panel.x, y, width, item_h },
+                              [this, action = item.action] {
+                                  menu_open = false;
+                                  action();
+                              } });
     }
     // swallow clicks on the panel padding
     menu_hits.push_back({ panel, [] {} });
+    menu_rect = panel;
 
     if (menu_open) {
         // menu is on top: check its items first
@@ -1131,10 +1552,14 @@ Rectangle Library::draw_switcher(Canvas& wnd, const double opacity)
             .y = pos.y + static_cast<ssize_t>(height / 2) - th / 2,
         };
         const bool active = std::abs(target - static_cast<double>(i)) < 0.5;
+        const Rectangle rect { seg_x, pos.y, seg_width, height };
+        if (hot(rect)) {
+            draw_hover(wnd, { seg_x, pos.y + inset, seg_width, hl_height },
+                       hl_height / 2, opacity);
+        }
         draw_text(wnd, *font_title, labels[i], tpos,
                   fade(active ? CLR_TEXT : CLR_TEXT_DIM, opacity));
 
-        const Rectangle rect { seg_x, pos.y, seg_width, height };
         if (i == 0) {
             hits.push_back({ rect, [this] {
                                 if (view != View::Photos) {
@@ -1189,11 +1614,17 @@ void Library::draw_albums_header(Canvas& wnd, const double opacity)
     hits.push_back({ rect, [this] {
                         add_folders();
                     } });
+    const Rectangle scan_rect = draw_button(
+        wnd, "Scan folders", { rect.x - dp(10), btn_y }, false, opacity);
+    hits.push_back({ scan_rect, [this] {
+                        add_sources();
+                    } });
 
     // title and number of albums
     const std::wstring title = L"Albums";
-    const std::wstring count = to_wide(std::format(
-        "{} {}", albums.size(), albums.size() == 1 ? "album" : "albums"));
+    const size_t total = album_info.size();
+    const std::wstring count = to_wide(
+        std::format("{} {}", total, total == 1 ? "album" : "albums"));
     const ssize_t th = text_height(*font_title);
     const ssize_t sh = text_height(*font_small);
     const ssize_t title_y = static_cast<ssize_t>(height / 2) - th / 2;
@@ -1321,11 +1752,19 @@ void Library::draw_header(Canvas& wnd, const double opacity)
               fade(CLR_TEXT_DIM, opacity));
 
     // back area: icon and title
-    hits.push_back({ { 0, 0, static_cast<size_t>(title_x + title_w + dp(8)),
-                       height },
-                     [this] {
-                         back();
-                     } });
+    const Rectangle back_rect { 0, 0,
+                                static_cast<size_t>(title_x + title_w + dp(8)),
+                                height };
+    if (hot(back_rect)) {
+        const size_t bh = dp(BUTTON_HEIGHT) + dp(6);
+        draw_hover(wnd,
+                   { dp(6), static_cast<ssize_t>(height / 2 - bh / 2),
+                     back_rect.width - dp(6), bh },
+                   bh / 2, opacity);
+    }
+    hits.push_back({ back_rect, [this] {
+                        back();
+                    } });
 }
 
 Rectangle Library::draw_button(Canvas& wnd, const std::string& text,
@@ -1340,6 +1779,9 @@ Rectangle Library::draw_button(Canvas& wnd, const std::string& text,
 
     wnd.mask(pill({ width, height }), { rect.x, rect.y },
              fade(primary ? CLR_ACCENT : CLR_BUTTON, opacity));
+    if (hot(rect)) {
+        draw_hover(wnd, rect, height / 2, opacity);
+    }
 
     const ssize_t th = text_height(*font_small);
     draw_text(wnd, *font_small, label,
@@ -1505,6 +1947,11 @@ bool Library::handle_mbutton(const InputMouse::mouse_btn_t button,
     if (!pressed) {
         const bool consumed = pressed_hit;
         pressed_hit = false;
+        if (hover_index >= 0) {
+            if (Ui* ui = Application::get_ui()) {
+                ui->set_cursor(Ui::CursorShape::Pointer); // reset on release
+            }
+        }
         return consumed;
     }
 
@@ -1659,6 +2106,77 @@ void Library::start_validation()
         }
         flush();
     }).detach();
+}
+
+namespace {
+/** Check if point is inside the rectangle. */
+bool contains(const Rectangle& rect, const Point& pt)
+{
+    return pt.x >= rect.x && pt.x < rect.x + static_cast<ssize_t>(rect.width) &&
+        pt.y >= rect.y && pt.y < rect.y + static_cast<ssize_t>(rect.height);
+}
+} // namespace
+
+bool Library::hot(const Rectangle& rect, const bool in_menu) const
+{
+    if (!hover_valid || pressed_hit) {
+        return false;
+    }
+    if (!in_menu && menu_open && contains(menu_rect, hover_pos)) {
+        return false; // covered by the menu
+    }
+    return contains(rect, hover_pos);
+}
+
+void Library::draw_hover(Canvas& wnd, const Rectangle& rect,
+                         const size_t radius, const double opacity)
+{
+    wnd.mask(Shapes::rounded_rect({ rect.width, rect.height }, radius),
+             { rect.x, rect.y }, fade(CLR_HOVER, opacity));
+}
+
+bool Library::update_hover()
+{
+    ssize_t index = -1;
+    if (hover_valid && view != View::None) {
+        for (size_t i = 0; i < hits.size(); ++i) {
+            if (contains(hits[i].rect, hover_pos)) {
+                index = static_cast<ssize_t>(i);
+                break;
+            }
+        }
+    }
+    if ((index >= 0) != (hover_index >= 0)) {
+        if (Ui* ui = Application::get_ui()) {
+            ui->set_cursor(index >= 0 ? Ui::CursorShape::Pointer
+                                      : Ui::CursorShape::Default);
+        }
+    }
+    const bool changed = index != hover_index;
+    hover_index = index;
+    return changed;
+}
+
+bool Library::handle_mmove(const Point& pos, const uint32_t buttons)
+{
+    if (view == View::None) {
+        return false;
+    }
+    hover_pos = pos;
+    hover_valid = true;
+    if (update_hover()) {
+        Application::redraw();
+    }
+    // don't steal moves while dragging (scroll bar, touchpad pan)
+    return hover_index >= 0 && buttons == 0;
+}
+
+void Library::pointer_leave()
+{
+    hover_valid = false;
+    if (update_hover()) {
+        Application::redraw();
+    }
 }
 
 bool Library::handle_key(const InputKeyboard& key)

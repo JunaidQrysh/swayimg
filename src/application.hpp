@@ -204,6 +204,7 @@ private:
     void handle_event(const AppEvent::Scroll& event);
     void handle_event(const AppEvent::MouseClick& event);
     void handle_event(const AppEvent::MouseMove& event);
+    void handle_event(const AppEvent::MouseLeave& event);
     void handle_event(const AppEvent::GesturePinch& event);
     void handle_event(const AppEvent::Signal& event);
     void handle_event(const AppEvent::DragAndDrop& event);

@@ -107,6 +107,7 @@ public:
     static void on_pointer_leave(void*, struct wl_pointer*, uint32_t,
                                  struct wl_surface*)
     {
+        Application::self().add_event(AppEvent::MouseLeave {});
     }
 
     static void on_pointer_motion(void* data, struct wl_pointer*, uint32_t,
@@ -1223,6 +1224,9 @@ void UiWayland::set_cursor(CursorShape shape)
             break;
         case CursorShape::Copy:
             wlshape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COPY;
+            break;
+        case CursorShape::Pointer:
+            wlshape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
             break;
         case CursorShape::Hide:
             wl_pointer_set_cursor(wl.pointer, 0, nullptr, 0, 0);

@@ -9,6 +9,7 @@
 #include "imagelist.hpp"
 #include "pathhash.hpp"
 #include "input.hpp"
+#include "shapes.hpp"
 #include "sparam.hpp"
 
 #include <atomic>
@@ -24,7 +25,8 @@ class FontSet;
 
 /**
  * Photo library.
- * Albums are user selected folders saved in the config directory. The app
+ * Albums are user selected folders saved in the config directory and all
+ * folders with media files inside user selected scan folders. The app
  * shows one of the views:
  * - Photos: all images of the albums marked as "shown in Photos";
  * - Albums: grid of saved albums (cover image, name, number of items);
@@ -46,6 +48,16 @@ public:
         All,    ///< Photos and videos
         Photos, ///< Photos only
         Videos, ///< Videos only
+    };
+
+    /** Order of the Albums grid. */
+    enum class AlbumSort : uint8_t {
+        Recent,      ///< Newest photo first
+        Oldest,      ///< Oldest newest-photo first
+        NameAsc,     ///< Folder name A-Z
+        NameDesc,    ///< Folder name Z-A
+        MostItems,   ///< Largest albums first
+        FewestItems, ///< Smallest albums first
     };
 
     /** Saved album. */
@@ -116,6 +128,12 @@ public:
      * @param new_filter filter to set
      */
     void set_filter(const Filter new_filter);
+
+    /**
+     * Set order of the Albums grid (saved in the config).
+     * @param order order to set
+     */
+    void set_album_sort(const AlbumSort order);
 
     /** Show Photos view. */
     void show_photos();
@@ -263,6 +281,17 @@ public:
                         const bool pressed, const Point& pos);
 
     /**
+     * Handle mouse move in gallery mode: hover feedback of the overlay.
+     * @param pos pointer coordinates
+     * @param buttons pressed mouse buttons
+     * @return true if pointer is over the overlay controls
+     */
+    bool handle_mmove(const Point& pos, const uint32_t buttons);
+
+    /** Handle mouse pointer leaving the window. */
+    void pointer_leave();
+
+    /**
      * Handle key press in gallery mode.
      * @param key key description
      * @return true if event was consumed
@@ -276,11 +305,43 @@ private:
         size_t count = 0;            ///< Number of images
     };
 
+    /** Folders with media files found in the scan folders. */
+    using Discovered = std::vector<std::pair<std::filesystem::path, AlbumInfo>>;
+
+    /** Popup menu item. */
+    struct MenuItem {
+        Shapes::Icon icon;            ///< Item icon
+        std::wstring label;           ///< Item text
+        bool selected;                ///< Item is checked
+        std::function<void()> action; ///< Click handler
+    };
+
     /** Clickable overlay area. */
     struct HitArea {
         Rectangle rect;               ///< Area on the window
         std::function<void()> action; ///< Click handler
     };
+
+    /**
+     * Find folders with media files in the scan folders in background,
+     * apply_discovered() is called on completion.
+     */
+    void start_discovery();
+
+    /**
+     * Save discovery results and merge them into the Albums grid.
+     * @param found discovered albums
+     */
+    void apply_discovered(Discovered found);
+
+    /** Load folders to search for albums from the config file. */
+    void load_sources();
+
+    /** Save folders to search for albums to the config file. */
+    void save_sources() const;
+
+    /** Show folder chooser and add selected folders to scan folders. */
+    void add_sources();
 
     /** Load saved albums from the config file. */
     void load();
@@ -339,19 +400,35 @@ private:
     Rectangle draw_switcher(Canvas& wnd, const double opacity);
 
     /**
-     * Draw filter button next to the switcher.
+     * Draw menu button next to the switcher.
      * @param switcher switcher rectangle
+     * @param icon button icon
+     * @param active true if non-default option is selected
      * @return button rectangle
      */
-    Rectangle draw_filter_button(Canvas& wnd, const Rectangle& switcher,
-                                 const double opacity);
+    Rectangle draw_menu_button(Canvas& wnd, const Rectangle& switcher,
+                               const Shapes::Icon icon, const bool active,
+                               const double opacity);
 
     /**
-     * Draw filter menu above the button.
-     * @param button filter button rectangle
+     * Draw popup menu above the button.
+     * @param button menu button rectangle
+     * @param items menu items
      */
-    void draw_filter_menu(Canvas& wnd, const Rectangle& button,
-                          const double opacity);
+    void draw_menu(Canvas& wnd, const Rectangle& button,
+                   const std::vector<MenuItem>& items, const double opacity);
+
+    /** Get media type filter menu. */
+    std::vector<MenuItem> filter_menu();
+
+    /** Get Albums order menu. */
+    std::vector<MenuItem> sort_menu();
+
+    /**
+     * Get comparator of album covers for the current Albums order.
+     * @return comparator
+     */
+    [[nodiscard]] ImageList::Comparator album_comparator() const;
 
     /** Draw header of the album view. */
     void draw_header(Canvas& wnd, const double opacity);
@@ -385,6 +462,29 @@ private:
                           const double opacity);
 
     /**
+     * Check if overlay control is under the mouse pointer.
+     * @param rect control area
+     * @param in_menu true if control is a popup menu item
+     * @return true if control is hovered
+     */
+    [[nodiscard]] bool hot(const Rectangle& rect,
+                           const bool in_menu = false) const;
+
+    /**
+     * Draw hover highlight.
+     * @param rect highlight area
+     * @param radius corner radius
+     */
+    void draw_hover(Canvas& wnd, const Rectangle& rect, const size_t radius,
+                    const double opacity);
+
+    /**
+     * Find control under the pointer and update mouse cursor.
+     * @return true if hovered control changed
+     */
+    bool update_hover();
+
+    /**
      * Get rounded rectangle (pill) mask of specified size.
      * @param size mask size
      * @return grayscale mask
@@ -411,6 +511,11 @@ private:
         cover_album;                      ///< Cover image to album map
     PathMap<AlbumInfo>
         album_info;                       ///< Albums scan results
+    std::vector<std::filesystem::path>
+        sources;                          ///< Folders to search for albums
+    Discovered discovered;                ///< Albums found in scan folders
+    bool discovering = false;             ///< Scan folders search in progress
+    bool rediscover = false;              ///< Search again when finished
 
     // UI
     FontSet* font_title = nullptr; ///< Font for titles
@@ -420,14 +525,19 @@ private:
     Pixmap chevron;                    ///< Back icon mask
     std::vector<HitArea> hits;         ///< Clickable areas from last frame
     bool pressed_hit = false;          ///< Mouse press consumed by overlay
+    Point hover_pos;                   ///< Mouse pointer position
+    bool hover_valid = false;          ///< Pointer is in the window
+    ssize_t hover_index = -1;          ///< Hovered control in hits
+    Rectangle menu_rect;               ///< Popup menu panel (last frame)
     double hl_pos = 0;                 ///< Switcher highlight position
     Filter filter = Filter::All;       ///< Media type filter
+    AlbumSort album_sort = AlbumSort::Recent; ///< Order of the Albums grid
     std::wstring toast_text;           ///< Notification text
     std::chrono::steady_clock::time_point toast_until; ///< Hide time
     double toast_alpha = 0;            ///< Notification visibility
     FdTimer toast_timer;               ///< Timer to start hiding
-    bool menu_open = false;            ///< Filter menu is open
-    double menu_anim = 0;              ///< Filter menu appearance progress
+    bool menu_open = false;            ///< Popup menu is open
+    double menu_anim = 0;              ///< Popup menu appearance progress
     size_t margin_top = 0;             ///< Gallery top inset
     size_t margin_bottom = 0;          ///< Gallery bottom inset
     size_t section_height = 0;         ///< Gallery section header height

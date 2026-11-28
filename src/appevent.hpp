@@ -61,6 +61,9 @@ struct MouseMove {
     Point delta;      ///< Delta between this and last call
 };
 
+/** Mouse pointer left the window. */
+struct MouseLeave {};
+
 /** Gesture: pinch event. */
 struct GesturePinch {
     double scale_delta; ///< Scale diff
@@ -107,6 +110,7 @@ using Holder = std::variant<WindowClose,
                             Scroll,
                             MouseClick,
                             MouseMove,
+                            MouseLeave,
                             GesturePinch,
                             Signal,
                             DragAndDrop,

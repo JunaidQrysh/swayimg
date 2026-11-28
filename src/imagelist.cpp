@@ -949,6 +949,16 @@ void ImageList::set_order(const Order new_order)
     }
 }
 
+void ImageList::set_comparator(Comparator cmp)
+{
+    if (!cmp && !comparator) {
+        return;
+    }
+    const std::scoped_lock lock(mutex);
+    comparator = std::move(cmp);
+    sort();
+}
+
 void ImageList::set_reverse(const bool enable)
 {
     if (reverse != enable) {
@@ -1256,7 +1266,12 @@ void ImageList::sort()
 
 void ImageList::sort(EntriesArray& entries) const
 {
-    if (order == Order::None) {
+    if (comparator) {
+        std::sort(entries.begin(), entries.end(),
+                  [this](const ImageEntryPtr& l, const ImageEntryPtr& r) {
+                      return comparator(*l, *r);
+                  });
+    } else if (order == Order::None) {
         // nothing to do
     } else if (order == Order::Random) {
         // shuffle list

@@ -699,6 +699,9 @@ void Application::handle_event(const AppEvent::Holder& event)
                                                 const AppEvent::MouseClick&>) {
                 handle_event(event);
             } else if constexpr (std::is_same_v<decltype(event),
+                                                const AppEvent::MouseLeave&>) {
+                handle_event(event);
+            } else if constexpr (std::is_same_v<decltype(event),
                                                 const AppEvent::MouseMove&>) {
                 handle_event(event);
             } else if constexpr (std::is_same_v<
@@ -867,7 +870,16 @@ void Application::handle_event(const AppEvent::MouseClick& event)
 
 void Application::handle_event(const AppEvent::MouseMove& event)
 {
+    if (active_mode == AppMode::Gallery && !transition.active &&
+        Library::self().handle_mmove(event.pointer, event.mouse.buttons)) {
+        return; // pointer is over the library overlay
+    }
     current_mode()->handle_mmove(event.mouse, event.pointer, event.delta);
+}
+
+void Application::handle_event(const AppEvent::MouseLeave&)
+{
+    Library::self().pointer_leave();
 }
 
 void Application::handle_event(const AppEvent::GesturePinch& event)

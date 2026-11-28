@@ -16,6 +16,7 @@ public:
         Drag,
         Copy,
         Hide,
+        Pointer,
     };
 
     /** Content types. */

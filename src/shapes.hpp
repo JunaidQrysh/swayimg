@@ -14,6 +14,10 @@ enum class Icon : uint8_t {
     All,    ///< Two stacked frames with check mark
     Photo,  ///< Picture frame with mountains and sun
     Video,  ///< Video camera
+    Sort,   ///< Up and down arrows
+    Clock,  ///< Clock face
+    Alpha,  ///< Letter A with down arrow
+    Stack,  ///< Stacked frames
 };
 
 /**
