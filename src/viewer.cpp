@@ -1644,6 +1644,15 @@ void Viewer::preloader_work()
             break;
         }
 
+        if (this == &Viewer::self() && VideoPlayer::is_video(next_entry) &&
+            EmbeddedVideo::available()) {
+            // video is opened with a poster from the thumbnail cache and then
+            // played, a decoded frame would be never shown
+            last_entry = next_entry;
+            ++counter;
+            continue;
+        }
+
         ImagePtr next_image = nullptr;
 
         // get existing image form history/preload cache

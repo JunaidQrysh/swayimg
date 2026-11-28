@@ -80,6 +80,11 @@ bool EmbeddedVideo::init()
         { "input-default-bindings", "no"        },
         { "input-vo-keyboard",      "no"        },
         { "audio-client-name",      "swayimg"   },
+        // keep audio stream running while paused: the file is loaded paused
+        // at the start of the opening transition, so the sound device wakes
+        // up from suspend (tens of ms) before playback, and video doesn't
+        // stall waiting for the audio clock
+        { "audio-stream-silence",   "yes"       },
         { "msg-level",              "all=warn"  },
     };
     for (const auto& [name, value] : options) {
@@ -144,9 +149,7 @@ bool EmbeddedVideo::start(const std::filesystem::path& path)
     percent_pos = 0;
 
     if (render_ctx) {
-        const std::string file = path.string();
-        const char* cmd[] = { "loadfile", file.c_str(), nullptr };
-        mpv_command_async(mpv, 0, cmd);
+        load(path.string());
     } else {
         // file is loaded when render context is created (on first frame)
         pending = path.string();
@@ -164,7 +167,26 @@ void EmbeddedVideo::stop()
     playing = false;
     frame_seen = false;
     started = false;
+    hold = false;
     pending.clear();
+}
+
+void EmbeddedVideo::set_pause(const bool pause)
+{
+    int flag = pause;
+    mpv_set_property_async(mpv, 0, "pause", MPV_FORMAT_FLAG, &flag);
+}
+
+void EmbeddedVideo::load(const std::string& file)
+{
+    // file may be loaded before its frames are shown (during the opening
+    // transition): don't let the clock run, otherwise the frames decoded
+    // meanwhile are dropped and playback visibly starts not from the
+    // first frame (async requests are executed in order)
+    hold = true;
+    set_pause(true);
+    const char* cmd[] = { "loadfile", file.c_str(), nullptr };
+    mpv_command_async(mpv, 0, cmd);
 }
 
 unsigned EmbeddedVideo::render(const Size& size, const double x,
@@ -256,6 +278,12 @@ unsigned EmbeddedVideo::render(const Size& size, const double x,
         mpv_render_context_render(render_ctx, params);
     }
 
+    if (hold) {
+        // the first frame is on the screen now, start playback
+        hold = false;
+        set_pause(false);
+    }
+
     return texture;
 }
 
@@ -279,7 +307,11 @@ void EmbeddedVideo::mouse_button(const char* name, const bool pressed)
 
 void EmbeddedVideo::toggle_pause()
 {
-    if (mpv) {
+    if (mpv && hold) {
+        // paused before the first frame was shown: just keep it paused
+        hold = false;
+        Application::redraw();
+    } else if (mpv) {
         const char* cmd[] = { "cycle", "pause", nullptr };
         mpv_command_async(mpv, 0, cmd);
         Application::redraw();
@@ -313,7 +345,7 @@ double EmbeddedVideo::progress()
 bool EmbeddedVideo::paused()
 {
     process_events();
-    return is_paused;
+    return is_paused && !hold;
 }
 
 void EmbeddedVideo::process_events()
@@ -371,8 +403,7 @@ bool EmbeddedVideo::create_render_context()
 
     // now video output is ready, load file
     if (!pending.empty()) {
-        const char* cmd[] = { "loadfile", pending.c_str(), nullptr };
-        mpv_command_async(mpv, 0, cmd);
+        load(pending);
         pending.clear();
     }
 

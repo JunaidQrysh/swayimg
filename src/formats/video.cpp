@@ -42,8 +42,8 @@ public:
             return nullptr;
         }
 
-        // single frame (at 1/3 of duration) as a placeholder, the video
-        // itself is played by an external player
+        // first frame as a placeholder (playback starts from it), the video
+        // itself is played by the player
         const double aspect = decoder.aspect();
         const size_t sz =
             std::min(std::max(decoder.width(), decoder.height()), size);
@@ -56,7 +56,7 @@ public:
         image->frames.resize(1);
         Pixmap& pm = image->frames[0].pm;
         pm.create(Pixmap::ARGB, width, height);
-        if (!decoder.grab_frame(decoder.duration() / 3, pm)) {
+        if (!decoder.grab_frame(decoder.start_time(), pm)) {
             return nullptr;
         }
 
@@ -88,7 +88,7 @@ public:
 
         Pixmap pm;
         pm.create(Pixmap::ARGB, tw, th);
-        if (!decoder.grab_frame(decoder.duration() / 3, pm)) {
+        if (!decoder.grab_frame(decoder.start_time(), pm)) {
             return {};
         }
 
@@ -363,6 +363,15 @@ private:
                 ratio = 1.0 / ratio;
             }
             return ratio;
+        }
+
+        /**
+         * Get timestamp of the first frame.
+         * @return start time in stream time base units
+         */
+        [[nodiscard]] int64_t start_time() const
+        {
+            return st->start_time != AV_NOPTS_VALUE ? st->start_time : 0;
         }
 
         /**

@@ -113,6 +113,12 @@ private:
     /** Create render context, GL context must be current. */
     bool create_render_context();
 
+    /** Set pause state of the player. */
+    void set_pause(const bool pause);
+
+    /** Load file paused, playback starts when its first frame is shown. */
+    void load(const std::string& file);
+
     static void on_update(void* ctx);
 
     mpv_handle* mpv = nullptr;
@@ -127,6 +133,7 @@ private:
     bool playing = false;    ///< Playback is active
     bool frame_seen = false; ///< At least one video frame decoded
     bool started = false;    ///< Playback of the current file started
+    bool hold = false;       ///< Paused until the first frame is shown
     double percent_pos = 0;  ///< Playback position (observed property)
     bool is_paused = false;  ///< Pause state (observed property)
     std::string pending;     ///< File to load when renderer is ready
